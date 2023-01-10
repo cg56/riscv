@@ -1,6 +1,10 @@
 //-----------------------------------------------------------------------------
 //
-// Add copyright message ??
+// Copyright 2023 Colm Gavin
+//
+// This emulator emulates a simple single-core RISC-V processor with 64Mbytes
+// of RAM and a memory-mapped 8250 UART for serial I/O (keyboard input and
+// text output).
 //
 //-----------------------------------------------------------------------------
 
@@ -17,12 +21,16 @@
 using namespace std;
 
 const bool debug = false;
-uint8_t *memory = nullptr;
-const int MemorySize = 64*1024*1024;
-const int ImageStart = 0x80000000;
-uint32_t begin_signature, end_signature;    //??
 
-uint32_t pc = ImageStart;   // Program counter
+// The ram is memory mapped into the address space from RamStart. So there is
+// lots of spare space for memory-mapped I/O before the start of the ram.
+
+uint8_t   *ram = nullptr;
+const int RamStart = 0x80000000;
+const int RamSize = 64*1024*1024;   // 64 Mbytes
+
+// Internal CPU registers
+uint32_t pc = RamStart;     // Program counter
 uint32_t xreg[32] = {0};    // Integer registers
 uint32_t csreg[4096] = {0}; // Control & Status registers
 
@@ -33,6 +41,7 @@ uint32_t csreg[4096] = {0}; // Control & Status registers
 const int mstatus  = 0x300; // Machine status register
 const int mie      = 0x304; // ??
 const int mtvec    = 0x305; // Machine trap-handler base address
+
 // Machine trap handling
 const int mscratch = 0x340; // ??
 const int mepc     = 0x341; // Machine exception program counter
@@ -44,15 +53,19 @@ bool waitingForInterrupt = false;
 int privilege = 3;         // Just 2 bits for 4 levels. Start in machine mode
 
 // CLINT registers, see https://chromitem-soc.readthedocs.io/en/latest/clint.html
+// These are memory-mapped timer registers
+
 uint32_t timerl = 0;
 uint32_t timerh = 0;
 uint32_t timermatchl = 0;
 uint32_t timermatchh = 0;
 
-/*
-0 0 1 1 0 0 0 0 0 1 0 0 mie
-0 0 1 1 0 1 0 0 0 1 0 0 mip
-*/
+
+//-----------------------------------------------------------------------------
+//
+// Print an error message and exit.
+//
+//-----------------------------------------------------------------------------
 
 static void errorExit(const string &message)
 {
@@ -60,6 +73,12 @@ static void errorExit(const string &message)
     exit(1);
 }
 
+#if 0
+//-----------------------------------------------------------------------------
+//
+// Convert "val" to a binary string.
+//
+//-----------------------------------------------------------------------------
 
 static string toBin(uint32_t val)
 {
@@ -71,7 +90,14 @@ static string toBin(uint32_t val)
     buffer[32] = '\0';
     return buffer;
 }
+#endif
 
+//-----------------------------------------------------------------------------
+//
+// Convert "val" to a hexidecimal string.
+// Easier than trying to use std::hex an a stringstream.
+//
+//-----------------------------------------------------------------------------
 
 static string toHex(uint32_t val)
 {
@@ -85,12 +111,13 @@ static string toHex(uint32_t val)
 }
 
 
-//-------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
 //
 // We want unbuffered keyboard input so we don't have to wait for a
-// trailing newline.
+// trailing newline. We can give each typed character to the emulated
+// machine as soon as it's typed.
 //
-//-------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
 
 static void setUnbufferedInput()
 {
@@ -107,12 +134,12 @@ static void setUnbufferedInput()
 }
 
 
-//-------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
 //
 // Check if there is an input character available. We don't want to block
 // the emulation if there is nothing to read.
 //
-//-------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
 
 static bool isCharAvailable()
 {
@@ -120,15 +147,14 @@ static bool isCharAvailable()
     ioctl(fileno(stdin), FIONREAD, &n);
 
     return n > 0;
-    //??return false;
 }
 
 
-//-------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
 //
-// Restore normal buffered input (when we are exiting).
+// Restore normal buffered input. Used when we are exiting.
 //
-//-------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
 
 static void resetBufferedInput()
 {
@@ -142,40 +168,114 @@ static void resetBufferedInput()
 }
 
 
+//-----------------------------------------------------------------------------
+//
+// If we hit an unknown instruction, there's probably something wrong with
+// our emulator. So print out the location and the instruction to help
+// debugging.
+//
+//-----------------------------------------------------------------------------
+
 static void unknownInstruction(uint32_t instr, int line)
 {
     errorExit("unknown instruction " + toHex(instr) + " at address " + toHex(pc-4) + " line " + to_string(line));
 }
 
 
+//-----------------------------------------------------------------------------
+//
+// The ram array is not mapped into the address space from zero, so we need
+// to convert an absolute address into a location in the ram array. 
+//
+//-----------------------------------------------------------------------------
+
 static uint32_t adjustAddress(uint32_t addr)
 {
-    addr -= ImageStart;
+    addr -= RamStart;
 
-    if (addr > MemorySize - 4)
-        errorExit("invalid memory access " + toHex(addr+ImageStart));  // Add memory mapped i/o ??
+    if (addr > RamSize - 4)
+        errorExit("invalid memory access " + toHex(addr+RamStart));
 
     return addr;
 }
 
 
+//-----------------------------------------------------------------------------
+//
+// Check if an address is within the memory-mapped I/O range.
+//
+//-----------------------------------------------------------------------------
+
+static bool isMemoryMappedIoAddress(uint32_t addr)
+{
+    return (addr >= 0x10000000) && (addr < 0x12000000);
+}
+
+
+//-----------------------------------------------------------------------------
+//
+// The UART has a few readable registers. We silently ignore most of them
+// except for the status register and receive buffer.
+// 
+// See https://web.archive.org/web/20160503070506/http://archive.pcjs.org/pubs/pc/datasheets/8250A-UART.pdf
+//
+//-----------------------------------------------------------------------------
+
+static uint8_t readUart(uint32_t addr)
+{
+    const uint8_t TransmitterHoldingRegisterIsEmpty = 0x40;
+    const uint8_t TransmitterIsEmpty                = 0x20;
+
+    // Our transmitter can never be non-empty, because we flush all writes
+    // to the transmitter holding buffer immediately.
+
+    if (addr == 0x10000005)     // 8250 Uart line status register
+        return TransmitterHoldingRegisterIsEmpty |
+               TransmitterIsEmpty |
+               isCharAvailable();
+
+    // We don't want to hang up in getchar(), so make sure a character
+    // is available before we call it just in case the caller didn't
+    // check the status register.
+
+    if (addr == 0x10000000)    // 8250 UART receive buffer
+        return isCharAvailable() ? getchar() : 0;
+
+    return 0;
+}
+
+
+//-----------------------------------------------------------------------------
+//
+// The UART has a few writable registers. We silently ignore most of them
+// except for bytes written to the transmit holding buffer.
+// 
+//-----------------------------------------------------------------------------
+
 static void writeUart(uint32_t addr, uint8_t val)
 {
-    if (addr == 0x10000000)  // 8250 Uart transmitt holding buffer
+    if (addr == 0x10000000)  // 8250 Uart transmitter holding buffer
     {
         printf("%c", val);
-        fflush(stdout);
+        fflush(stdout);     // Not the most efficient, but keeps the output flowing.
     }
 }
 
 
-static uint32_t readHardware(uint32_t addr)
+//-----------------------------------------------------------------------------
+//
+// We support four 32-bit memory mapped registers for the CLINT timer and
+// timer match registers.
+// 
+//-----------------------------------------------------------------------------
+
+static uint32_t readHardware32(uint32_t addr)
 {
-    if (addr == 0x10000005)     // 8250 Uart line status register
-        return 0x60 | isCharAvailable();
-    if ((addr == 0x10000000) && isCharAvailable()) // 8250 Uart receive buffer
-        return getchar();
-    if (addr == 0x1100bffc)     // CLINT timer register (64-bit)
+    if (addr == 0x11004000)
+        return timermatchl;
+    if (addr == 0x11004004)
+        return timermatchh;
+    if (addr == 0x1100bffc)
         return timerh;
     if (addr == 0x1100bff8)
         return timerl;
@@ -184,106 +284,164 @@ static uint32_t readHardware(uint32_t addr)
 }
 
 
-static void writeHardware(uint32_t addr, uint32_t val)
+//-----------------------------------------------------------------------------
+//
+// Although we can read four 32-bit registers, only two of them are
+// writable to set the timer match in the CLINT. We also support writing
+// to a system control register for power-off.
+// 
+//-----------------------------------------------------------------------------
+
+static void writeHardware32(uint32_t addr, uint32_t val)
 {
-    if (addr == 0x11004000)         //CLINT
+    if (addr == 0x11004000)
         timermatchl = val;
-    else if (addr == 0x11004004)    //CLINT
+    else if (addr == 0x11004004)
         timermatchh = val;
-	else if (addr == 0x11100000)    //SYSCON (reboot, poweroff, etc.)
+	else if (addr == 0x11100000)    // System control
         exit(0);
 }
 
 
+//-----------------------------------------------------------------------------
+// 
+// Perform a 32-bit aligned read, either from ram or memory-mapped I/O.
+//
+//-----------------------------------------------------------------------------
+
 static uint32_t read32(uint32_t addr)
 {
+    // Is the address aligned to 32-bits?
+
     if (addr & 0x3)
     {
         csreg[mtval] = addr;
         throw (uint32_t)4;  // Load-address-misaligned exception
     }
 
-    if ((addr >= 0x10000000) && (addr < 0x12000000))
-        return readHardware(addr);
+    // Read from ram or memory-mapped I/O
+
+    if (isMemoryMappedIoAddress(addr))
+        return readHardware32(addr);
     else
-        return *(uint32_t *)&memory[adjustAddress(addr)];
+        return *(uint32_t *)&ram[adjustAddress(addr)];
 }
 
 
-static void checkAndExit()
-{
-    for (uint32_t addr = begin_signature; addr < end_signature; addr += 4)
-        printf("%08x\n", read32(addr));
-    exit(0);
-}
-
+//-----------------------------------------------------------------------------
+// 
+// Perform a 32-bit aligned write, either to ram or memory-mapped I/O.
+//
+//-----------------------------------------------------------------------------
 
 static void write32(uint32_t addr, uint32_t val)
 {
+    // Is the address aligned to 32-bits?
+
     if (addr & 0x3)
     {
         csreg[mtval] = addr;
         throw (uint32_t)6;  // Store-address-misaligned exception
     }
 
-    //if (addr == 0x80001000)    // Hack for testcases ??
-        //checkAndExit();
-    if ((addr >= 0x10000000) && (addr < 0x12000000))
-        writeHardware(addr, val);
+    // Write to ram or memory-mapped I/O
+
+    if (isMemoryMappedIoAddress(addr))
+        writeHardware32(addr, val);
     else
-        *(uint32_t *)&memory[adjustAddress(addr)] = val;
+        *(uint32_t *)&ram[adjustAddress(addr)] = val;
 }
 
 
+//-----------------------------------------------------------------------------
+// 
+// Perform a 16-bit aligned read, only from ram because we don't have any
+// 16-bit memory-mapped I/O registers.
+//
+//-----------------------------------------------------------------------------
+
 static uint16_t read16(uint32_t addr)
 {
+    // Is the address aligned to 32-bits?
+
     if (addr & 0x1)
     {
         csreg[mtval] = addr;
         throw (uint32_t)4;  // Load-address-misaligned exception
     }
 
-    if ((addr >= 0x10000000) && (addr < 0x12000000))
-        return readHardware(addr);
-    else
-        return *(uint16_t *)&memory[adjustAddress(addr)];
+    // Read from ram
+
+    return *(uint16_t *)&ram[adjustAddress(addr)];
 }
 
 
+//-----------------------------------------------------------------------------
+// 
+// Perform a 16-bit aligned write, only to ram because we don't have any
+// 16-bit memory-mapped I/O registers.
+//
+//-----------------------------------------------------------------------------
+
 static void write16(uint32_t addr, uint16_t val)
 {
+    // Is the address aligned to 32-bits?
+
     if (addr & 0x1)
     {
         csreg[mtval] = addr;
         throw (uint32_t)6;  // Store-address-misaligned exception
     }
 
-    *(uint16_t *)&memory[adjustAddress(addr)] = val;
+    // Write to ram
+
+    *(uint16_t *)&ram[adjustAddress(addr)] = val;
 }
 
+
+//-----------------------------------------------------------------------------
+// 
+// Perform a 8-bit read, either from ram or memory-mapped I/O. There are
+// no alignment issues for byte reads.
+//
+//-----------------------------------------------------------------------------
 
 static uint8_t read8(uint32_t addr)
 {
-    if ((addr >= 0x10000000) && (addr < 0x12000000))
-        return readHardware(addr);
+    if (isMemoryMappedIoAddress(addr))
+        return readUart(addr);
     else
-        return memory[adjustAddress(addr)];
+        return ram[adjustAddress(addr)];
 }
 
+
+//-----------------------------------------------------------------------------
+// 
+// Perform a 8-bit write, either to ram or memory-mapped I/O. There are
+// no alignment issues for byte reads.
+//
+//-----------------------------------------------------------------------------
 
 static void write8(uint32_t addr, uint8_t val)
 {
     if ((addr >= 0x10000000) && (addr < 0x10000008))
         writeUart(addr, val);
     else
-        memory[adjustAddress(addr)] = val;
+        ram[adjustAddress(addr)] = val;
 }
 
+
+//-----------------------------------------------------------------------------
+// 
+// Dump the internal state of all the registers plus a few important CSR
+// registers too.
+//
+//-----------------------------------------------------------------------------
 
 static void dumpState()
 {
 	printf("%08x ", pc);
-    if (pc - ImageStart <=  MemorySize - 4)
+    if (pc - RamStart <=  RamSize - 4)
 		printf("[%08x] ", read32(pc)); 
 	else
 		printf("[xxxxxxxxxx] "); 
@@ -301,28 +459,15 @@ static void dumpState()
     printf("p:%d w:%c ms:%08x ie:%08x sc:%08x tv:%08x ip:%08x",
         privilege, (waitingForInterrupt?'T':'F'), csreg[mstatus], csreg[mie], csreg[mscratch], csreg[mtval], csreg[mip]);
     printf(" tmr %08x %08x %08x %08x", timerh, timerl, timermatchh, timermatchl);
-    //printf(" [%08x]", read32(0x8040f034));
-    //printf("%08x@%08x %08x %08x %08x\n", instr, pc-4, csreg[mip], csreg[mie], csreg[mstatus]);
-    //printf("%08x@%08x %08x %08x %08x %08x %08x\n", instr, pc-4, xreg[10], xreg[11], xreg[13], xreg[14], xreg[21]);
-    //printf("%08x@%08x %08x\n", instr, pc-4, read32(0x802efe28));
-    //printf("%08x@%08x %08x %08x %08x %08x\n", instr, pc-4, timerh, timerl, timermatchh, timermatchl);
     printf("\n");
 }
 
 
-static void readTestcaseElf(const string &filename)
-{
-    ifstream in(filename);
-    if (!in.good())
-        errorExit("cannot read elf file: " + filename);
-
-    in.read((char *)memory, 0x1000);   // Skip the start of elf files ??
-    in.read((char *)memory, MemorySize);
-
-    if (!in.eof())
-        errorExit("image file is larger than available memory");
-}
-
+//-----------------------------------------------------------------------------
+// 
+// Read in an image to run.
+//
+//-----------------------------------------------------------------------------
 
 static void readImage(const string &filename)
 {
@@ -330,29 +475,42 @@ static void readImage(const string &filename)
     if (!in.good())
         errorExit("cannot read image file: " + filename);
 
-    in.read((char *)memory, MemorySize);
+    in.read((char *)ram, RamSize);
 
     if (!in.eof())
         errorExit("image file is larger than available memory");
 }
 
 
+//-----------------------------------------------------------------------------
+// 
+// Put the DTB at the end of the ram and update it with the size of the 
+// available memory.
+//
+//-----------------------------------------------------------------------------
+
 static void loadDtb()
 {
-    uint32_t dtb = MemorySize - sizeof(default64mbdtb) - 48*4;  //??
-    memcpy(&memory[dtb], default64mbdtb, sizeof(default64mbdtb));
+    uint32_t dtb = RamSize - sizeof(default64mbdtb);
 
-    uint32_t addr = dtb + 0x13c;
-    //printf("Dtb 1 %08x\n", *(uint32_t *)&memory[addr]);
-    //printf("%08x\n", read32(addr + ImageStart));
+    memcpy(&ram[dtb], default64mbdtb, sizeof(default64mbdtb));
 
-    write32(dtb + 0x13c + ImageStart, htonl(dtb));
+    // The size of the available memory is actually just the location of
+    // the DTB
 
-    //printf("Dtb 2 %08x\n", *(uint32_t *)&memory[addr]);
+    write32(dtb + 0x13c + RamStart, htonl(dtb));
 
-    xreg[11] = dtb + ImageStart;
+    // Pass the DTB location to the image that is being run
+
+    xreg[11] = dtb + RamStart;
 }
 
+
+//-----------------------------------------------------------------------------
+// 
+// Validates the alignment of the address before setting the PC.
+// 
+//-----------------------------------------------------------------------------
 
 static void setpc(uint32_t addr)
 {
@@ -366,6 +524,14 @@ static void setpc(uint32_t addr)
 
     pc = addr;
 }
+
+
+//-----------------------------------------------------------------------------
+// 
+// This is it, the emulator engine! This function emulates a single
+// RISC-V instruction supporting the IMA configuration.
+// 
+//-----------------------------------------------------------------------------
 
 static void executeInstruction()
 {
@@ -384,24 +550,18 @@ static void executeInstruction()
     int opcode = (instr >> 0) & 0x7f;   // 7 bits
 
     // I-type
-    int immI   = instr >> 20;
-    int immIs  = (int32_t)instr >> 20; // Sign extended
+    uint32_t immIu = instr >> 20;           // Unsigned, not sign extended
+    int32_t  immI  = (int32_t)instr >> 20;  // Sign extended
 
     // S-type
-    int immS = ((instr >>  7) & 0x0000001f) |
-               ((instr >> 20) & 0x00000fe0);
-    int immSs = ((instr >>  7) & 0x0000001f) |
-                (((int32_t)instr >> 20) & 0xffffffe0);
+    int32_t immS = ((instr >>  7) & 0x0000001f) |
+                   (((int32_t)instr >> 20) & 0xffffffe0);  // Sign extended
 
     // B-type
-    int immB = ((instr >>  7) & 0x0000001e) |    // Lowest bit is always zero
+    int immB = ((instr >>  7) & 0x0000001e) |   // Lowest bit is always zero
                ((instr >> 20) & 0x000007e0) |
                ((instr <<  4) & 0x00000800) |
-               ((instr >> 19) & 0x00001000);
-    int immBs = ((instr >>  7) & 0x0000001e) |    // Lowest bit is always zero
-                ((instr >> 20) & 0x000007e0) |
-                ((instr <<  4) & 0x00000800) |
-                (((int32_t)instr >> 19) & 0xfffff000);
+               (((int32_t)instr >> 19) & 0xfffff000);   // Sign extended
 
     // U-type
 
@@ -411,11 +571,7 @@ static void executeInstruction()
     int immJ = ((instr >> 20) & 0x000007fe) |
                ((instr >>  9) & 0x00000800) |
                ((instr >>  0) & 0x000ff000) |
-               ((instr >> 11) & 0x00100000);
-    int immJs = ((instr >> 20) & 0x000007fe) |
-                ((instr >>  9) & 0x00000800) |
-                ((instr >>  0) & 0x000ff000) |
-                (((int32_t)instr >> 11) & 0xfff00000);
+               (((int32_t)instr >> 11) & 0xfff00000);   // Sign extended
 
     /*
     inst[4:2] 000  001      010      011      100    101      110            111
@@ -432,19 +588,19 @@ static void executeInstruction()
             switch (funct3)
             {
                 case 0b000: // LB, Load byte, signed
-                    xreg[rd] = (int8_t)read8(xreg[rs1] + immIs);
+                    xreg[rd] = (int8_t)read8(xreg[rs1] + immI);
                     break;
                 case 0b001: // LH, Load short, signed
-                    xreg[rd] = (int16_t)read16(xreg[rs1] + immIs);
+                    xreg[rd] = (int16_t)read16(xreg[rs1] + immI);
                     break;
                 case 0b010: // LW, Load word
-                    xreg[rd] = read32(xreg[rs1] + immIs);
+                    xreg[rd] = read32(xreg[rs1] + immI);
                     break;
                 case 0b100: // LBU, Load unsigned byte
-                    xreg[rd] = read8(xreg[rs1] + immIs);
+                    xreg[rd] = read8(xreg[rs1] + immI);
                     break;
                 case 0b101: // LHU, Load unsigned short 
-                    xreg[rd] = read16(xreg[rs1] + immIs);
+                    xreg[rd] = read16(xreg[rs1] + immI);
                     break;
                 default:
                     unknownInstruction(instr, __LINE__);
@@ -467,45 +623,45 @@ static void executeInstruction()
             switch (funct3)
             {
                 case 0b000: // ADDI, add immediate
-                    xreg[rd] = xreg[rs1] + immIs;
+                    xreg[rd] = xreg[rs1] + immI;
                     break;
                 case 0b001:
                     switch (funct7)
                     {
                         case 0b0000000: // SLLI, Logical shift left immediate
-                            xreg[rd] = xreg[rs1] << (immI & 0x1f);
+                            xreg[rd] = xreg[rs1] << (immIu & 0x1f);
                             break;
                         default:
                             unknownInstruction(instr, __LINE__);
                     }
                     break;
                 case 0b010: // SLTI, Set less than immediate (signed)
-                    xreg[rd] = ((int32_t)xreg[rs1] < immIs) ? 1 : 0;
+                    xreg[rd] = ((int32_t)xreg[rs1] < immI) ? 1 : 0;
                     break;
                 case 0b011: // SLTIU, Set less than immediate unsigned
-                    xreg[rd] = (xreg[rs1] < immIs) ? 1 : 0;
+                    xreg[rd] = (xreg[rs1] < immIu) ? 1 : 0;
                     break;
                 case 0b100: // XORI, xor immediate
-                    xreg[rd] = xreg[rs1] ^ immIs;
+                    xreg[rd] = xreg[rs1] ^ immI;
                     break;
                 case 0b101:
                     switch (funct7)
                     {
                         case 0b0000000: // SRLI, Logical shift right immediate
-                            xreg[rd] = xreg[rs1] >> (immIs & 0x1f);
+                            xreg[rd] = xreg[rs1] >> (immI & 0x1f);
                             break;
                         case 0b0100000: // SRAI, Arithmetic shift right immediate
-                            xreg[rd] = (int32_t)xreg[rs1] >> (immIs & 0x1f);
+                            xreg[rd] = (int32_t)xreg[rs1] >> (immI & 0x1f);
                             break;
                         default:
                             unknownInstruction(instr, __LINE__);
                     }
                     break;
                 case 0b110: // ORI, or immediate
-                    xreg[rd] = xreg[rs1] | immIs;
+                    xreg[rd] = xreg[rs1] | immI;
                     break;
                 case 0b111: // ANDI, and immediate
-                    xreg[rd] = xreg[rs1] & immIs;
+                    xreg[rd] = xreg[rs1] & immI;
                     break;
                 default:
                     unknownInstruction(instr, __LINE__);
@@ -520,13 +676,13 @@ static void executeInstruction()
             switch (funct3)
             {
                 case 0b000: // SB, Store byte (8-bits)
-                    write8(xreg[rs1] + immSs, xreg[rs2]);
+                    write8(xreg[rs1] + immS, xreg[rs2]);
                     break;
                 case 0b001: // SH, Store short (16-bits)
-                    write16(xreg[rs1] + immSs, xreg[rs2]);
+                    write16(xreg[rs1] + immS, xreg[rs2]);
                     break;
                 case 0b010: // SW, Store word (32-bits)
-                    write32(xreg[rs1] + immSs, xreg[rs2]);
+                    write32(xreg[rs1] + immS, xreg[rs2]);
                     break;
                 default:
                     unknownInstruction(instr, __LINE__);
@@ -669,27 +825,27 @@ static void executeInstruction()
             {
                 case 0b000: // BEQ, Branch if equal
                     if (xreg[rs1] == xreg[rs2])
-                        setpc(pc - 4 + immBs);
+                        setpc(pc - 4 + immB);
                     break;
                 case 0b001: // BNE, Branch if not equal
                     if (xreg[rs1] != xreg[rs2])
-                        setpc(pc - 4 + immBs);
+                        setpc(pc - 4 + immB);
                     break;
                 case 0b100: // BLT, Branch if less than, signed
                     if ((int32_t)xreg[rs1] < (int32_t)xreg[rs2])
-                        setpc(pc - 4 + immBs);
+                        setpc(pc - 4 + immB);
                     break;
                 case 0b101: // BGE, Branch if greater or equal, signed
                     if ((int32_t)xreg[rs1] >= (int32_t)xreg[rs2])
-                        setpc(pc - 4 + immBs);
+                        setpc(pc - 4 + immB);
                     break;
                 case 0b110: // BLTU, Branch if less than, unsigned
                     if (xreg[rs1] < xreg[rs2])
-                        setpc(pc - 4 + immBs);
+                        setpc(pc - 4 + immB);
                     break;
                 case 0b111: // BGEU, Branch if greater or equal, unsigned
                     if (xreg[rs1] >= xreg[rs2])
-                        setpc(pc - 4 + immBs);
+                        setpc(pc - 4 + immB);
                     break;
                 default:
                     unknownInstruction(instr, __LINE__);
@@ -699,14 +855,14 @@ static void executeInstruction()
         case 0b1100111: // JALR, I-type
         {
             uint32_t tmp = pc;
-            setpc((xreg[rs1] + immIs) & ~1);
+            setpc((xreg[rs1] + immI) & ~1);
             xreg[rd] = tmp;
         }
             break;
 
         case 0b1101111: // JAL, Jump and link, J-type
             xreg[rd] = pc;
-            setpc(pc - 4 + immJs);
+            setpc(pc - 4 + immJ);
             break;
 
         // No need to worry about atomic instructions, because only 1 core and no cache.
@@ -717,7 +873,7 @@ static void executeInstruction()
                 uint32_t tmp;
 
                 case 0b000:
-                    switch (immI)
+                    switch (immIu)
                     {
                         case 0b000000000000:    // ECALL
                             csreg[mtval] = pc-4;
@@ -750,31 +906,31 @@ static void executeInstruction()
                             unknownInstruction(instr, __LINE__);
                     }
                 case 0b001: // CSRRW, Atomic read/write CSR
-                    tmp = csreg[immI];
-                    csreg[immI]  = xreg[rs1];
+                    tmp = csreg[immIu];
+                    csreg[immIu]  = xreg[rs1];
                     xreg[rd]     = tmp;
                     break;
                 case 0b010: // CSRRS, Atomic read and set bits in CSR
-                    tmp = csreg[immI];
-                    csreg[immI] |= xreg[rs1];
+                    tmp = csreg[immIu];
+                    csreg[immIu] |= xreg[rs1];
                     xreg[rd]     = tmp;
                     break;
                 case 0b011: // CSRRC, Atomic read and clear bits in CSR
-                    tmp = csreg[immI];
-                    csreg[immI] &= ~xreg[rs1];
+                    tmp = csreg[immIu];
+                    csreg[immIu] &= ~xreg[rs1];
                     xreg[rd]     = tmp;
                     break;
                 case 0b101: // CSRRWI, Atomic read/write CSR immediate
-                    xreg[rd] = csreg[immI];
-                    csreg[immI] = rs1;
+                    xreg[rd] = csreg[immIu];
+                    csreg[immIu] = rs1;
                     break;
                 case 0b110: // CSRRSI, Atomic read/write CSR immediate
-                    xreg[rd] = csreg[immI];
-                    csreg[immI] |= rs1;
+                    xreg[rd] = csreg[immIu];
+                    csreg[immIu] |= rs1;
                     break;
                 case 0b111: // CSRRCI, Atomic read and clear bits in CSR immediate
-                    xreg[rd] = csreg[immI];
-                    csreg[immI] &= ~rs1;
+                    xreg[rd] = csreg[immIu];
+                    csreg[immIu] &= ~rs1;
                     break;
                 default:
                     unknownInstruction(instr, __LINE__);
@@ -787,6 +943,13 @@ static void executeInstruction()
 }
 
 
+//-----------------------------------------------------------------------------
+// 
+// Get the time since the epoch (in microseconds) as a single 64-bit
+// number.
+// 
+//-----------------------------------------------------------------------------
+
 static uint64_t gettime()
 {
     struct timeval tv;
@@ -796,10 +959,17 @@ static uint64_t gettime()
 }
 
 
+//-----------------------------------------------------------------------------
+// 
+// Run the emulator forever until the image exits or something goes wrong.
+// 
+//-----------------------------------------------------------------------------
+
 static void run()
 {
-    uint64_t startTime = 0; //??gettime();
-    uint64_t instrCount = 0;
+#ifdef FIXED_CLOCK
+    uint64_t startTime = 0;
+#endif // FIXED_CLOCK
 
     while (1)
     {
@@ -808,14 +978,17 @@ static void run()
 
         try
         {
-            if (++instrCount % 1000 == 0)
-            {
-            // Update the timer. No need to check every single instruction ??
+            // Update the timer. Very inefficint to set for every single instruction,
+            // but this is just an emulator so performance isn't critical.
 
-            uint64_t now = gettime(); //??startTime++;
+#ifdef FIXED_CLOCK
+            uint64_t now = startTime++;
+#else
+            uint64_t now = gettime();
+#endif // FIXED_CLOCK
+
             timerh = now >> 32;
             timerl = now & 0xffffffff;
-            }
 
             // Timer expired?
 
@@ -861,6 +1034,12 @@ static void run()
 }
 
 
+//-----------------------------------------------------------------------------
+// 
+// Let's go!
+// 
+//-----------------------------------------------------------------------------
+
 int main(int argc, char *argv[])
 {
     atexit(resetBufferedInput);
@@ -869,7 +1048,7 @@ int main(int argc, char *argv[])
     cout << "Welcome to Colm's risc-v emulator!\n"
          << "This emulator supports rv32ima instruction set." << endl;
 
-    memory = new uint8_t[MemorySize];
+    ram = new uint8_t[RamSize];
 
     if (argc == 2)
     {
@@ -877,12 +1056,8 @@ int main(int argc, char *argv[])
         readImage(argv[1]);
         loadDtb();
     }
-    else if (argc == 4)
-    {
-        sscanf(argv[1], "%x", &begin_signature);
-        sscanf(argv[2], "%x", &end_signature);
-        readTestcaseElf(argv[3]);
-    }
+    else
+        errorExit("usage: riscv-emulator <ImageFile>");
 
     run();
 }
