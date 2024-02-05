@@ -1,43 +1,24 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
-// 
-// Create Date: 01/13/2023 07:51:47 PM
-// Design Name: 
-// Module Name: memory
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: 
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.01 - File Created
-// Additional Comments:
 //
-// The client enables the memory's data bus and initates a read or a write cycle.
-// When the read or write has been completed by the memory, the complete signal
-// will go high to notify the client. In the case of a read cycle, the data_out
-// is valid at this point. When the client has obtained the data, it will then
-// lower the read/write signal to notify the memory that the read/write request
-// has completed. The complete signal will then return low and at this point
-// another cycle can begin.
-//                  ____   ____
-// enable     _____/    ...    \_____
-//                  ____   ____
-// read/write _____/    ...    \_____
-//                           _____
-// complete   __________..._/     \__
+// Interface between the CPU bus and the DDR memory signals. Most of the logic
+// is taken care of by the mig module, but we need a state machine to drive it.
+//
+// The memory reads and writes two 64-bit packets (128-bits total), so the
+// appropriate bits of a packet are accessed for 8, 16, or 32 bytes.
+//
+// CPU reads and writes must be alligned. E.g: 32-bit words can only be accessed
+// on 4 byte boundaries.
+//
+// Copyright (c) Colm Gavin, 2024
 // 
 //////////////////////////////////////////////////////////////////////////////////
 
-module memory(
+module ram(
     input clock,            // 200MHz clock for the mig
     input reset,            // Active high reset
-    input[26:0] address,
-    inout[31:0] data_io,
+    input[26:0] address,    // 128Kbyte address space
+    inout[31:0] data_io,    // Data in for write, data out for read
     input[1:0] width,       // 0 = 8 bits, 1 = 16 bits, 2 = 32 bits 
     input enable,           // Enable the memory for reading or writing
     input read,             // Request to read from the memory
@@ -69,7 +50,7 @@ module memory(
     reg         mem_enable;     // Strobe for the inputs to the mig
     reg         write_enable;
     reg[63:0]   write_data;
-    reg[7:0]    write_mask;
+    reg[7:0]    write_mask;     // 1 bit per byte
     reg         write_end;      // Signals last write clock cycle
     wire[63:0]  read_data;
     wire        read_end;
@@ -79,7 +60,7 @@ module memory(
     
     wire        memory_ready;   // Memory is ready to accept a command
     wire        write_ready;    // Write queue has space
-    wire        ui_clk;         // Clock from the mig to drive the caller
+    wire        ui_clk;         // Clock from the mig to drive the state machine
     wire        ui_reset;       // When low we can use the mig
   
     // Instantiate the mig to interface with the DDR memory
@@ -126,7 +107,7 @@ module memory(
         .sys_rst(~reset)    // System reset
         );
 
-    // Signals
+    // Tri-state bus
     
     reg[31:0] data_out;
     assign data_io = (read & enable) ? data_out : 32'bZ;

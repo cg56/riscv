@@ -1,49 +1,38 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
-// 
-// Create Date: 01/14/2023 10:11:28 PM
-// Design Name: 
-// Module Name: seven_segment_display
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: 
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.01 - File Created
-// Additional Comments:
+//
+// Displays a 32-bit value on the 7-segment display as 8 hex characters.
+//
+// Copyright (c) Colm Gavin, 2024
 // 
 //////////////////////////////////////////////////////////////////////////////////
 
-
 module seven_segment_display(
-    input clk,
-    input rst_n,
-    input [31:0] value,
-    output reg [6:0] segments,
-    output reg [7:0] anodes
+    input clk,                  // 100MHz system clock
+    input reset,                // Active high reset
+    input [31:0] value,         // What to display
+    output reg [6:0] segments,  // Drive the 7 segments
+    output reg [7:0] anodes     // Driver the 8 digit anodes
     );
     
-    reg[31:0] segment_counter;
+    reg[31:0] delay_counter;
     reg[3:0] digit;
     
     always @(posedge clk) begin
-        if (!rst_n) begin
+        if (reset) begin
             anodes <= 8'b1111_1110;
-            segment_counter <= 0;
+            delay_counter <= 0;
         end else begin
-            if (segment_counter == 100000) begin
-                segment_counter <= 0;
-                anodes <= {anodes[6:0], anodes[7]};
+            if (delay_counter == 100000) begin
+                delay_counter <= 0;
+                anodes <= {anodes[6:0], anodes[7]}; // Select the next digit
             end else begin
-                segment_counter <= segment_counter +1;
+                delay_counter <= delay_counter+1;   // Wait a while to show it
             end
         end
     
+        // Which 4 bits of the input value should we display?
+        
         case (anodes)
             default:        digit = value[3:0];
             8'b1111_1101:   digit = value[7:4];
@@ -56,18 +45,20 @@ module seven_segment_display(
         endcase
     end
     
+    // What segments do we need to light up for each number?
+    
     always @(*)
     case (digit)
-        0: segments = 7'b1000000;
-        1: segments = 7'b1111001;
-        2: segments = 7'b0100100;
-        3: segments = 7'b0110000;
-        4: segments = 7'b0011001;
-        5: segments = 7'b0010010;
-        6: segments = 7'b0000010;
-        7: segments = 7'b1111000;
-        8: segments = 7'b0000000;
-        9: segments = 7'b0010000;
+        'h0: segments = 7'b1000000;
+        'h1: segments = 7'b1111001;
+        'h2: segments = 7'b0100100;
+        'h3: segments = 7'b0110000;
+        'h4: segments = 7'b0011001;
+        'h5: segments = 7'b0010010;
+        'h6: segments = 7'b0000010;
+        'h7: segments = 7'b1111000;
+        'h8: segments = 7'b0000000;
+        'h9: segments = 7'b0010000;
         'hA: segments = 7'b0001000; 
         'hB: segments = 7'b0000011; 
         'hC: segments = 7'b1000110;

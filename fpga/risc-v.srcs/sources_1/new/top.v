@@ -1,22 +1,26 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
+//
+// RISC-V based computer with 128Kbytes of memory an serial comms.
+//
+// Copyright (c) Colm Gavin, 2024
 // 
-// Create Date: 01/14/2023 09:45:48 PM
-// Design Name: 
-// Module Name: top
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: 
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.01 - File Created
-// Additional Comments:
-// 
+// Description of the memory bus
+//
+// The CPU sets the address on the bus and initates a read or a write cycle.
+// When the read or write has been completed by the memory (or memory-mapped I/O
+// device), it sets the complete signal high to notify the CPU. In the case of a
+// read cycle, the data out is valid at this point. When the CPU has latched the
+// data, it will then lower the read/write signal to notify the memory that the
+// read/write request has completed. The complete signal will then return low and
+// at this point another cycle can begin.
+//                  ____   ____
+// address    _____/    ...    \_____
+//                  ____   ____
+// read/write _____/    ...    \_____
+//                           _____
+// complete   __________..._/     \__
+//
 //////////////////////////////////////////////////////////////////////////////////
 
 module top(
@@ -33,7 +37,7 @@ module top(
     output[15:0] LED,
     output CA, CB, CC, CD, CE, CF, CG,
     output [7:0] AN,
-    input[2:0] SW,
+    input[15:0] SW,
     
     // DDR memory tnterface
     
@@ -53,55 +57,63 @@ module top(
     output ddr2_odt
     );
 
+    // Create the clocks
+    
+    wire clk_200mhz;    // 200MHz memory clock
+    wire clk_100mhz;    // 100Mhz system clock
+    wire clk_cpu;       // Cpu clock, also 100MHz but can be changed independently
+    wire pll_locked;    // High if the clock is stable
+    
+    clocks clocks1(
+        .clk_in(CLK100MHZ),
+        .clk_200mhz(clk_200mhz),
+        .clk_100mhz(clk_100mhz),
+        .clk_cpu(clk_cpu),
+        .locked(pll_locked)
+        );
+
+    // Debounce the reset switch
+    
+    wire reset_switch;
+    debounce db(clk_100mhz, ~CPU_RESETN, reset_switch);
+    wire reset = ~pll_locked | reset_switch;    // Master reset
+
     // Display for debug output
     
-    wire[31:0] sseg_data;
+    wire[31:0] sseg_data;   // The value to be displayed
     
     seven_segment_display sseg(
-        .clk(CLK100MHZ),
-        .rst_n(CPU_RESETN),
+        .clk(clk_100mhz),
+        .reset(reset),
         .value(sseg_data),
         .segments({CG,CF,CE,CD,CC,CB,CA}),
         .anodes(AN)
     );
-    
-    // Create the clocks
-    
-    wire clk_200mhz;
-    wire clk_100mhz;
-    wire pll_locked;
-    
-    clocks clocks1(
-        .clk_in(CLK100MHZ),
-        .clk_200mhz(clk_200mhz),  // 200MHz memory clock
-        .clk_100mhz(clk_100mhz),  // 50Mhz cpu clock (may get faster!)    // Rename ??
-        .locked(pll_locked) // High if the clock is stable
-        );
-    
-    wire reset = ~pll_locked | ~CPU_RESETN;
-    
-    // The memory controller
+
+    // Define the I/O bus from the CPU to memory and memory-mapped I/O
     
     wire[31:0] address;
     wire[31:0] data_io;
-    wire[1:0]  width;   // Byte, short or word
+    wire[1:0]  width;   // 00 = 8-bit byte, 01 = 16-bit short, 10 = 32-bit word
     wire       read;
     wire       write;
-    wire       ram_enable;
-    wire       ram_complete;
+    
+    // The memory controller
+    
+    wire ram_enable;    // Data requested or data is ready to write
+    wire ram_complete;  // Data is ready or data has been written
   
-    memory mem1(
+    ram memory(
         .clock(clk_200mhz),
         .reset(reset),
-
-        .address(address[26:0]),
+        .address(address[26:0]), // 27-bit address lines for 128Kbyte of memory
         .data_io(data_io),
         .width(width),
         .enable(ram_enable),
         .read(read),
         .write(write),
         .complete(ram_complete),
-
+        // DDR memory tnterface
         .ddr2_dq(ddr2_dq),
         .ddr2_dqs_n(ddr2_dqs_n),
         .ddr2_dqs_p(ddr2_dqs_p),
@@ -120,13 +132,13 @@ module top(
 
     // Rom with the hard-coded boot loader
     
-    wire rom_enable;
-    wire rom_complete;
+    wire rom_enable;    // Data requested
+    wire rom_complete;  // Data is ready
     
     rom bootroom(
-        .clock(clk_100mhz),
+        .clock(clk_200mhz),
         .reset(reset),
-        .address(address[11:0]),
+        .address(address[12:0]),
         .data_io(data_io),
         .enable(rom_enable),
         .read(read),
@@ -138,7 +150,6 @@ module top(
     wire clint_enable;
     wire clint_complete;
     wire interrupt_req;
-    wire[63:0] instr_count;    //??
     
     clint clint1(
         .clock(clk_100mhz),
@@ -149,8 +160,7 @@ module top(
         .read(read),
         .write(write),
         .complete(clint_complete),
-        .interrupt_req(interrupt_req),
-        .instr_count(instr_count)
+        .interrupt_req(interrupt_req)
         );
         
     // 8250 UART
@@ -159,7 +169,7 @@ module top(
     wire uart_complete;
     
     uart uart1(
-        .clk(CLK100MHZ/*clk_100mhz*/),
+        .clk(clk_100mhz),
         .reset(reset),
         .address(address[7:0]),
         .data_io(data_io),
@@ -175,7 +185,7 @@ module top(
     
     wire spi_enable;
     wire spi_complete;
-    assign SD_DAT[2:1] = 2'b11;
+    assign SD_DAT[2:1] = 2'b11; // We don't use these two pins
     
     spi spi1(
         .clock(clk_100mhz),
@@ -194,6 +204,20 @@ module top(
         .miso(SD_DAT[0])
     );
     
+    // Memory-map some of the switches
+    
+    wire sw_enable;
+    wire sw_complete;
+    
+    switches swit(
+        .switches(SW[7:0]),
+        .clock(clk_100mhz),
+        .data_io(data_io),
+        .enable(sw_enable),
+        .read(read),
+        .complete(sw_complete)
+    );
+    
     // Address decoder
     
     address_decoder adec(
@@ -202,21 +226,16 @@ module top(
         .rom_enable(rom_enable),
         .uart_enable(uart_enable),
         .clint_enable(clint_enable),
-        .spi_enable(spi_enable)
+        .spi_enable(spi_enable),
+        .sw_enable(sw_enable)
     );
     
-    wire complete = ram_complete | rom_complete | uart_complete | clint_complete | spi_complete;
-    
-    reg[32:0] slow_clk;  // Move into riscv module ??
-    always @(posedge clk_100mhz) begin
-        slow_clk <= slow_clk + 1;
-    end
-    
+    wire complete = ram_complete | rom_complete | uart_complete | clint_complete | spi_complete | sw_complete;
+
     // The CPU itself
     
     cpu cpu1(
-        //.clock(clk_100mhz),
-        .clock(SW[2] ? slow_clk[27] : slow_clk[6]),
+        .clock(clk_cpu),
         .reset(reset), 
         .address(address),
         .data_io(data_io),
@@ -225,10 +244,9 @@ module top(
         .read(read),
         .complete(complete),
         .interrupt_req(interrupt_req),
-        .led(LED[15:0]),
+        .led(LED[15:8]),
         .sseg_data(sseg_data),
-        .debug(SW[1:0]),
-        .instr_count(instr_count)
+        .debug(SW[15:14])
     );
     
 `ifdef DOIT
