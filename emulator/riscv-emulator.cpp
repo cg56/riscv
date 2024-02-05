@@ -20,7 +20,8 @@
 
 using namespace std;
 
-const bool debug = false;
+//#define FIXED_CLOCK 1
+bool debug = false;
 
 // The ram is memory mapped into the address space from RamStart. So there is
 // lots of spare space for memory-mapped I/O before the start of the ram.
@@ -39,16 +40,16 @@ uint32_t csreg[4096] = {0}; // Control & Status registers
 
 // Machine trap setup
 const int mstatus  = 0x300; // Machine status register
-const int mie      = 0x304; // ??
+const int misa     = 0x301; // Isa and extentions (Add support for misa??)
+const int mie      = 0x304; // Machine interrupt enable register
 const int mtvec    = 0x305; // Machine trap-handler base address
 
 // Machine trap handling
-const int mscratch = 0x340; // ??
+const int mscratch = 0x340; // Scratch register for machine trap handlers
 const int mepc     = 0x341; // Machine exception program counter
 const int mcause   = 0x342; // Machine trap cause
-const int mtval    = 0x343; // Machine bad address
+const int mtval    = 0x343; // Machine bad address or instruction
 const int mip      = 0x344; // Machine interrupt pending
-// Add support for misa??
 bool waitingForInterrupt = false;
 int privilege = 3;         // Just 2 bits for 4 levels. Start in machine mode
 
@@ -456,9 +457,10 @@ static void dumpState()
         xreg[20], xreg[21], xreg[22], xreg[23],
 		xreg[24], xreg[25], xreg[26], xreg[27],
         xreg[28], xreg[29], xreg[30], xreg[31]);
-    printf("p:%d w:%c ms:%08x ie:%08x sc:%08x tv:%08x ip:%08x",
-        privilege, (waitingForInterrupt?'T':'F'), csreg[mstatus], csreg[mie], csreg[mscratch], csreg[mtval], csreg[mip]);
-    printf(" tmr %08x %08x %08x %08x", timerh, timerl, timermatchh, timermatchl);
+    printf("%08x", 0);
+    //printf("p:%d w:%c ms:%08x ie:%08x sc:%08x tv:%08x ip:%08x",
+    //    privilege, (waitingForInterrupt?'T':'F'), csreg[mstatus], csreg[mie], csreg[mscratch], csreg[mtval], csreg[mip]);
+    //printf(" tmr %08x %08x %08x %08x", timerh, timerl, timermatchh, timermatchl);
     printf("\n");
 }
 
@@ -772,14 +774,14 @@ static void executeInstruction()
                 case 0b0000001:
                     switch (funct3)
                     {
-                        case 0b000:     // MUL, multiply
+                        case 0b000:     // MUL, multiply low words
                             xreg[rd] = xreg[rs1] * xreg[rs2];
                             break;
                         case 0b001:     // MULH, multiply high word (signed x signed)
-                            xreg[rd] = ((int64_t)xreg[rs1] * (int64_t)xreg[rs2]) >> 32;
+                            xreg[rd] = ((int64_t)(int32_t)xreg[rs1] * (int64_t)(int32_t)xreg[rs2]) >> 32;
                             break;
                         case 0b010:     // MULHSU, multiply high word (signed x unsigned)
-                            xreg[rd] = ((int64_t)xreg[rs1] * (uint64_t)xreg[rs2]) >> 32;
+                            xreg[rd] = ((int64_t)(int32_t)xreg[rs1] * (uint64_t)xreg[rs2]) >> 32;
                             break;
                         case 0b011:     // MULHU, multiply high word (unsigned x unsigned)
                             xreg[rd] = ((uint64_t)xreg[rs1] * (uint64_t)xreg[rs2]) >> 32;
@@ -791,7 +793,7 @@ static void executeInstruction()
                             xreg[rd] = (xreg[rs2] == 0) ? -1 : xreg[rs1] / xreg[rs2];
                             break;
                         case 0b110:     // REM
-                            xreg[rd] = (int32_t)xreg[rs1] % (uint32_t)xreg[rs2];
+                            xreg[rd] = (int32_t)xreg[rs1] % (int32_t)xreg[rs2];
                             break;
                         case 0b111:     // REMU
                             xreg[rd] = xreg[rs1] % xreg[rs2];
@@ -888,8 +890,8 @@ static void executeInstruction()
                             break;
                         case 0b000100000101:    // WFI, wait for interrupt
                             waitingForInterrupt = true;
-                            csreg[mstatus] |= 8;    // Enable interrupts??
-                            return;             // Nothing more to do
+                            //pc = pc - 4;        // Stay where we are
+                            break;
                         case 0b001100000010:    // MRET
                             {
 							uint32_t tmp_status = csreg[mstatus];
@@ -942,7 +944,7 @@ static void executeInstruction()
     }
 }
 
-
+#ifndef FIXED_CLOCK
 //-----------------------------------------------------------------------------
 // 
 // Get the time since the epoch (in microseconds) as a single 64-bit
@@ -957,7 +959,7 @@ static uint64_t gettime()
 
     return (uint64_t)tv.tv_usec + (uint64_t)tv.tv_sec * 1000000;
 }
-
+#endif
 
 //-----------------------------------------------------------------------------
 // 
@@ -993,8 +995,10 @@ static void run()
             // Timer expired?
 
             if ((timermatchl || timermatchh)
-             && ((timerh > timermatchh) || ((timerh == timermatchh) && (timerl > timermatchl))))
+             && ((timerh > timermatchh) || ((timerh == timermatchh) && (timerl >= timermatchl))))
             {
+                if (debug)
+                    printf("Timer interrupt\n");
                 waitingForInterrupt = false;
                 csreg[mip] |= 1<<7;
             }
@@ -1008,6 +1012,8 @@ static void run()
              && (csreg[mie] & (1<<7))
              && (csreg[mstatus] & 0x8))
             {
+                if (debug)
+                    printf("Handling timer interrupt\n");
                 csreg[mtval] = 0;
                 throw (uint32_t)0x80000007;  // Timer interrupt
             }
@@ -1050,14 +1056,12 @@ int main(int argc, char *argv[])
 
     ram = new uint8_t[RamSize];
 
-    if (argc == 2)
-    {
-        // ./riscv-emulator ../mini-rv32ima-master/buildroot/output/images/Image
-        readImage(argv[1]);
-        loadDtb();
-    }
-    else
+    if (argc != 2)
         errorExit("usage: riscv-emulator <ImageFile>");
+
+    // ./riscv-emulator ../mini-rv32ima-master/buildroot/output/images/Image
+    readImage(argv[1]);
+    loadDtb();
 
     run();
 }

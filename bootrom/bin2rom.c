@@ -10,7 +10,7 @@ int main(int argc, const char *argv[])
     int addr = 0;
 
     while (fread(&word, 1, 4, fp) == 4)
-        printf("\t\t\t\t%d:\tword <= 32'h%08x;\n", addr++, word);
+        printf("%4d:\tword <= 32'h%08x;\n", addr++, word);
 
     fclose(fp);
 }

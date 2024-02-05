@@ -28,6 +28,8 @@
 #include <stdlib.h>
 #endif
 
+//#define DEBUG
+
 typedef int bool;
 #define false   0
 #define true    1
@@ -105,18 +107,32 @@ struct CardInfo
 // Important locations in memory
 
 #if !SIM
-volatile unsigned char *uartData     = (unsigned char *)0x10000000;
-volatile unsigned char *uartCtrl     = (unsigned char *)0x10000005;
-volatile unsigned char  *spiStatus   = (unsigned char *)0x12000000;
-volatile unsigned char  *spiData     = (unsigned char *)0x12000001;
-volatile unsigned char  *spiResponse = (unsigned char *)0x12000002;
-volatile unsigned char  *spiZero     = (unsigned char *)0x12000003;
+volatile unsigned char  *uartData    = (unsigned char  *)0x10000000;
+volatile unsigned char  *uartCtrl    = (unsigned char  *)0x10000005;
+volatile unsigned char  *spiStatus   = (unsigned char  *)0x12000000;
+volatile unsigned char  *spiData     = (unsigned char  *)0x12000001;
+volatile unsigned char  *spiResponse = (unsigned char  *)0x12000002;
+volatile unsigned char  *spiZero     = (unsigned char  *)0x12000003;
 volatile unsigned short *spiDivisor  = (unsigned short *)0x12000004;
 volatile unsigned short *spiCrc      = (unsigned short *)0x12000006;
-volatile unsigned int   *spiWord     = (unsigned int *)0x12000008;
+volatile unsigned int   *spiWord     = (unsigned int   *)0x12000008;
+volatile unsigned char  *switches    = (unsigned char  *)0x13000008;
 
 unsigned char *memory = (unsigned char *)0x80000000;
 #endif
+
+
+//-----------------------------------------------------------------------------
+//
+// Read from a CSR register.
+//
+//-----------------------------------------------------------------------------
+
+#define CSR_READ(v, csr)            \
+__asm__ __volatile__ ("csrr %0, %1" \
+    : "=r" (v)                      \
+    : "n" (csr)                     \
+    : /* clobbers: none */)
 
 
 //-----------------------------------------------------------------------------
@@ -275,7 +291,7 @@ static void setChipSelect(int enable)
 {
     *spiData = 0xff;
     *spiStatus = (enable) ? 0x02 : 0x00;    // Bit 1 is chip select
-    //*spiData = 0xff;
+    *spiData = 0xff;
 }
 
 
@@ -287,12 +303,31 @@ static void setChipSelect(int enable)
 
 static unsigned char sendCommand(unsigned char *bytes)
 {
+#ifdef DEBUG
+    if (bytes[0] != 0x51)
+    {
+        printStr("Sending ");
+        printByteHex(bytes[0]);
+    }
+#endif
+
     *spiData = 0xff;
 
     for (int i = 0; i < 6; ++i)
         *spiData = bytes[i];
 
-    return *spiResponse;
+    unsigned char resp = *spiResponse;
+
+#ifdef DEBUG
+    if (bytes[0] != 0x51)
+    {
+        printStr("=>");
+        printByteHex(resp);
+        printStr("\r\n");
+    }
+#endif
+
+    return resp;
 }
 
 
@@ -339,6 +374,31 @@ static void initSpi()
 
     // Wait (forever) for the card to be ready
 
+    int errorCount = 0;
+
+    do
+    {
+        unsigned char cmd55[] = {0x77, 0x00, 0x00, 0x00, 0x00, 0x65};
+        if ((sendCommand(cmd55) & 0xfe) == 0x00)
+        {
+            unsigned char cmd41[] = {0x69, 0x40, 0x00, 0x00, 0x00, 0xe5};
+            resp = sendCommand(cmd41);
+            if (resp & 0xfe) {
+                ++errorCount;
+                printStr("Error CMD41 => ");
+                printByteHex(resp);
+                printStr("\r\n");
+            }
+        }
+        else
+        {
+            printStr("Error CMD55 => ");
+            printByteHex(resp);
+            printStr("\r\n");
+        }
+    }
+    while ((resp != 0) && (errorCount < 5));
+#if 0
     do
     {
         unsigned char cmd55[] = {0x77, 0x00, 0x00, 0x00, 0x00, 0x65};
@@ -351,6 +411,7 @@ static void initSpi()
             error("CMD41");
     }
     while (resp != 0);
+#endif
 
     // Increase the clock frequency from the default 100KHz up to 25MHz
     // 100MHz input clock / 4 = 25MHz
@@ -856,11 +917,6 @@ static void initdtb()
 
     for (int i = 0; i < sizeof(default64mbdtb); ++i)
         dtb[i] = default64mbdtb[i];
-
-    //dtb[0x13c+0] = 0x03;    //??
-    //dtb[0x13c+1] = 0xff;
-    //dtb[0x13c+2] = 0xfa;
-    //dtb[0x13c+3] = 0x00;
 #endif
 }
 
@@ -886,28 +942,143 @@ static void clearMemory()
         *(p++) = 0;
 }
 
-
+#if !SIM
 //-----------------------------------------------------------------------------
 //
 // Load the image to be executed from the CF card.
 //
 //-----------------------------------------------------------------------------
 
+static void bootFromCard()
+{
+    struct CardInfo cinfo;
+
+    printStr("Booting");
+
+	initSpi();
+	loadFat(&cinfo);
+    (void)readFile(&cinfo, "IMAGE   BIN", memory);
+    initdtb();
+}
+
+
+//-----------------------------------------------------------------------------
+//
+// Load the code to be executed from the serial port.
+//
+//-----------------------------------------------------------------------------
+
+static void bootFromSerial()
+{
+    error("not yet implemented");
+}
+
+
+//-----------------------------------------------------------------------------
+//
+// Load the code to be executed from the serial port.
+//
+//-----------------------------------------------------------------------------
+
+__attribute__((optimize("O0"))) static void performanceTest()
+{
+    printStr("Measuring performance\r\n");
+
+    while (1)
+    {
+        unsigned int sum = 0;
+
+        for (int i = 0; i < 1000000; ++i)
+            sum += i;
+
+        unsigned int mcycle;
+        unsigned int minstret;
+
+        CSR_READ(mcycle,   0xf00);
+        CSR_READ(minstret, 0xf01);
+
+        printStr("mcycle ");
+        printInt(mcycle);
+        printStr(", minstret ");
+        printInt(minstret);
+        printStr(", sum ");
+        printInt(sum);
+        printStr("\r\n");
+    }
+}
+
+
+//-----------------------------------------------------------------------------
+//
+// Load the code to be executed from the serial port.
+//
+//-----------------------------------------------------------------------------
+
+static void memoryTest()
+{
+    printStr("Memory test\r\n");
+
+    const int Size = 128*1024;
+
+    for (int s = 0; s <=24; ++s)
+    {
+        printInt(s);
+
+        unsigned char *ptr = memory;
+        for (int i = 0; i < Size; ++i)
+            ptr[i] = (i >> s);
+
+        for (int i = 0; i < Size; ++i)
+        {
+            if (ptr[i] != ((i >> s) & 0xff))
+                error("readback");
+        }
+
+        printStr(" ok\r\n");
+    }
+}
+
+
+//-----------------------------------------------------------------------------
+//
+//-----------------------------------------------------------------------------
+
 int main()
 {
-    printStr("RISC-V by Colm Gavin\r\nBooting");
+    printStr("RISC-V by Colm Gavin\r\n");
+
+    switch (*switches & 0x03)
+    {
+        case 0:
+            bootFromCard();
+            break;
+        case 1:
+            bootFromSerial();
+            break;
+        case 2:
+            performanceTest();  // Will (and must) never return
+            break;
+        case 3:
+            while (1)
+                memoryTest();   // Must never return
+            break;
+    }
+
+    // When main returns, the assembly code will jump to 0x80000000
+}
+#else
+int main()
+{
+    printStr("RISC-V by Colm Gavin\r\nBooting\r\n");
 
     struct CardInfo cinfo;
-#if SIM
     char *memory = malloc(4*1024*1024);
-#endif
 
 	initSpi();
 	loadFat(&cinfo);
     unsigned int size = readFile(&cinfo, "IMAGE   BIN", memory);
     initdtb();
 
-#if SIM
     // Confirm everything we expect was read
 
     printf("Read %d bytes\n", size);
@@ -923,5 +1094,5 @@ int main()
 
     if (sum != 4294012248)
         printf("ERROR!\n");
-#endif
 }
+#endif
