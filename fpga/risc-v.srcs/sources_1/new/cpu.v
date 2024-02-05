@@ -1,53 +1,42 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
+//
+// Implements a single core RISC-V cpu.
+// Supports integer multiplication and division.
 // 
-// Create Date: 01/24/2023 06:35:48 PM
-// Design Name: 
-// Module Name: riscv
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: 
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.01 - File Created
-// Additional Comments:
+// Copyright Colm Gavin, 2024. All rights reserved.
 // 
 ///////////////////////////////////////////////////////////////////////////////////
 
-//`include "csregs.vh"
-
 module cpu(
-    input clock,
-    input reset,
+    input clock,                // 100Mhz clock
+    input reset,                // Active high reset
     output reg[31:0] address,
     inout[31:0] data_io,
-    output reg[1:0] width,  // 0 = 32 bits, 1 = 16 bits, 2 = 8 bits
-    output reg write,
-    output reg read,
-    input complete,
-    input interrupt_req,
-    output[15:0] led,
-    output reg[31:0] sseg_data,
-    input[1:0] debug,
-    output reg[63:0] instr_count
+    output reg[1:0] width,      // 0 = 32 bits, 1 = 16 bits, 2 = 8 bits
+    output reg write,           // Write cucle
+    output reg read,            // Read cycle
+    input complete,             // Read/write cycle is complete
+    input interrupt_req,        // Timer interrupt request
+    output[7:0] led,            // For debug
+    output reg[31:0] sseg_data, // For debug
+    input[1:0] debug            // For debug
     );
     
     reg[31:0] data_out;
-    assign data_io = write ? data_out : 32'bZ;
+    reg drive = 0;
+    assign data_io = drive ? data_out : 32'bZ;
     
     reg[31:0] pc;               // Program counter
     reg[31:0] ireg;             // Instruction register
     reg[31:0] xreg[31:0];       // 32x registers
+    reg[31:0] areg;             // ALU input register
+    reg[31:0] breg;             // ALU input register
+    reg[31:0] rreg;             // ALU result register
+    reg[31:0] dreg;             // Data (load) input register
+    reg[31:0] jaddr;            // Jump address register
     reg[1:0]  privilege;        // 3 = machine mode, 0 = user mode
     reg halt;
-
-    assign led[0] = halt;
-    assign led[1] = interrupt_req;
 
     reg[8:0] digit; //??
     reg[7:0] char; //??
@@ -59,6 +48,7 @@ module cpu(
     reg[31:0]  csreg_wdata;
     reg        csreg_read;
     reg        csreg_write;
+    reg        instr_fetch;
     reg[31:0] trap;
     reg       mret;
     wire[31:0] mtvec;     // Trap handler address
@@ -67,7 +57,6 @@ module cpu(
     wire interrupt;
     wire[31:0] trace_count;
     wire[31:0] trace_mask;
-    assign led[2] = interrupt;
 
     csregs csregs1(
         .clock(clock),
@@ -78,6 +67,7 @@ module cpu(
         .read(csreg_read),
         .write(csreg_write),
         .complete(csreg_complete),
+        .fetch(instr_fetch),
         .trap(trap),
         .mret(mret),
         .pc(pc),
@@ -88,8 +78,8 @@ module cpu(
         .mpp(mpp),
         .interrupt(interrupt),
         .trace_count(trace_count),
-        .trace_mask(trace_mask),
-        .led(led[4:3])
+        .trace_mask(trace_mask)//,
+        //.led(led[4:3])
         );
         
     // Instruction bit-patterns
@@ -112,103 +102,93 @@ module cpu(
     reg[31:0] remainder;
     reg[31:0] memval;
     
-    assign led[15:8] = state;   //??
+    assign led[7:0] = state;   //??
     
-    localparam FETCH   = 0;
-    localparam DECODE  = 1;
-    localparam LOAD    = 2;
-    localparam LOADREG = 3;
-    localparam MISCMEM = 4;
-    localparam OPIMM   = 5;
-    localparam AUIPC   = 6;
-    localparam STORE   = 7;
-    localparam AMO     = 8;
-    localparam AMOW    = 9;
-    localparam OP      = 10;
-    localparam MULT    = 11;
-    localparam MULT1   = 12;
-    localparam DIV     = 13;
-    localparam DIV1    = 14;
-    localparam SHIFT   = 15;
-    localparam LUI     = 16;
-    localparam BRANCH  = 17;
-    localparam JALR    = 18;
-    localparam JAL     = 19;
-    localparam SYSTEM  = 20;
-    localparam CSRREAD  = 21;
-    localparam CSRWRITE = 22;
-    localparam CSRDONE  = 23;
-    localparam DUMP    = 24;
-    localparam DEBUG   = 25;
-    localparam NEXT    = 26;
-    localparam INTR    = 27;
-    localparam TRAP    = 28;
-    localparam MRET    = 29;
-    localparam HALT    = 30;
-    localparam DUMP1 = 31;  //??
-    localparam DUMP2 = 32;
-    localparam DUMP3 = 33;
+    localparam FETCH    = 0;
+    localparam FETCH_W  = 1;
+    localparam DECODE   = 2;
+    localparam LOAD     = 3;
+    localparam LOAD_W   = 4;
+    localparam LOAD_END = 36;   //??
+    localparam MISCMEM  = 5;
+    localparam OPIMM    = 6;
+    localparam AUIPC    = 7;
+    localparam STORE    = 8;
+    localparam STORE_W  = 9;
+    localparam AMO      = 10;
+    localparam AMO_W    = 11;
+    localparam AMO_WR   = 12;
+    localparam AMO_WR_W = 13;
+    localparam OP       = 14;
+    localparam MULT     = 15;
+    localparam MULT1    = 16;
+    localparam DIV      = 17;
+    localparam DIV1     = 18;
+    localparam SHIFT    = 19;
+    localparam LUI      = 20;
+    localparam BRANCH   = 21;
+    localparam BRANCH2  = 35;   //??
+    localparam JALR     = 22;
+    localparam JAL      = 23;
+    localparam SYSTEM   = 24;
+    localparam CSRREAD  = 25;
+    localparam CSRWRITE = 26;
+    localparam CSRDONE  = 27;
+    localparam DUMP     = 28;
+    localparam DEBUG    = 29;
+    localparam NEXT     = 30;
+    localparam INTR     = 31;
+    localparam TRAP     = 32;
+    localparam MRET     = 33;
+    localparam HALT     = 34;
     
     always @(posedge clock) begin
         if (reset) begin
             state     <= FETCH;
             read      <= 0;
             write     <= 0;
+            drive     <= 0;
             address   <= 32'h00000000;
             data_out  <= 32'h0;
             width     <= 2'h2;
             pc        <= 32'h00000000;
             privilege <= 3;
+            instr_fetch <= 0;
             halt      <= 0;
             trap      <= 0;
             mret      <= 0;
-            instr_count <= 0;
+            sseg_data <= 32'h00;
         end else begin
             case (state)
-            FETCH: begin    // Instruction fetch         
+
+            FETCH: begin        // Begin instruction fetch         
                 xreg[0] <= 0;   // Xreg[0] must always contain zero. Set it to zero just in case it was written to. Ideally we wouldn't allow it to be written, but it's easier to just reset it.
                 
-                if (complete == 0) begin
+                if (complete == 0) begin    // Ensure previous memory access has completed before continuing
                     address <= pc;
                     width   <= 2'h2;
-                    read    <= 1;
-                    if (debug[0])
-                        sseg_data <= pc;
-                end else begin
-                    ireg  <= data_io;
-                    read  <= 0;
-                    //state <= (pc[31] & debug[1]) ? DUMP : DECODE;
-                    if (pc == 32'h80000000)
-                        instr_count <= 0;
-                    else
-                        instr_count <= instr_count+1;
-                    state <= ((pc[31:24] == 8'h80) & (instr_count > {32'h0,trace_count}) /*& ((instr_count & {32'h0,trace_mask}) == 64'h0)*/ & debug[1]) ? DUMP : DECODE;
-                    digit <= 0; //??
-                    if (~debug[0])
-                        sseg_data <= instr_count;
-                    //    sseg_data <= data_io;
+                    read        <= 1;   // Start the read cycle
+                    instr_fetch <= 1;
+                    state   <= FETCH_W;
                 end
             end
-            
-            /*DUMP: begin
-                if (complete == 0)
-                    state <= DUMP1;
-            end
-            
-            DUMP1: begin
+
+            FETCH_W: begin      // Wait for the instruction to be available
                 if (complete == 0) begin
-                    address <= 32'h8032e494;
-                    width   <= 2'h2;
-                    read    <= 1;
-                end else begin
-                    memval <= data_io;
-                    read   <= 0;
-                    state  <= DUMP3;
+                    //read        <= 1;   // Start the read cycle
+                    //instr_fetch <= 1;
+                end else begin          // Data is available
+                    ireg  <= data_io;
+                    read  <= 0;         // We're done
+                    instr_fetch <= 0;
+                    //state <= (pc[31] & debug[1]) ? DUMP : DECODE;
+                    //state <= ((pc[31:24] == 8'h80) & (instr_count > {32'h0,trace_count}) /*& ((instr_count & {32'h0,trace_mask}) == 64'h0)*/ & debug[1]) ? DUMP : DECODE;
+                    state <= DECODE;
+                    //digit <= 0; //??
                 end
             end
             
-            DUMP3: begin*/
-            DUMP: begin    // Wait for the previous read/write to be complete
+            /*DUMP: begin    // Wait for the previous read/write to be complete
                 case (digit)
                 `include "char_debug.vh"
                 default: char <= 4'h0;
@@ -222,16 +202,20 @@ module cpu(
             
             DEBUG: begin
                 if (complete == 0) begin
-                    data_out <= (char < 10) ? (char+8'h30) : (char < 16) ? (char+8'h57) : (char&8'h7f);
-                    address <= 32'h10000000;
-                    width   <= 2'h0;
-                    write   <= 1;
+                    if (drive == 0) begin
+                        data_out <= (char < 10) ? (char+8'h30) : (char < 16) ? (char+8'h57) : (char&8'h7f);
+                        address <= 32'h10000000;
+                        width   <= 2'h0;
+                        drive   <= 1;
+                    end else
+                        write   <= 1;
                 end else begin
                     write <= 0;
+                    drive <= 0;
                     digit <= digit+1;
                     state <= DUMP;
                 end
-            end
+            end*/
             
             // inst[4:2] 000  001      010      011      100    101      110            111
             // inst[6:5] (> 32b)
@@ -241,62 +225,61 @@ module cpu(
             // 11      BRANCH JALR     reserved JAL      SYSTEM reserved custom-3/rv128 ? 80b
 
             DECODE: begin
-                if (complete == 0) begin
-                    case (ireg[6:0])
-                    7'b0000011: state <= LOAD;
-                    7'b0001111: state <= MISCMEM;
-                    7'b0010011: state <= OPIMM;
-                    7'b0010111: state <= AUIPC;
-                    7'b0100011: state <= STORE;
-                    7'b0101111: state <= AMO;
-                    7'b0110011: state <= OP;
-                    7'b0110111: state <= LUI;
-                    7'b1100011: state <= BRANCH;
-                    7'b1100111: state <= JALR;
-                    7'b1101111: state <= JAL;
-                    7'b1110011: state <= SYSTEM;
-                    default:    state <= HALT;
-                    endcase
+                sseg_data <= debug[0] ? pc : ireg;
+
+                areg <= xreg[rs1];
+                breg <= xreg[rs2];
+                jaddr <= {{19{ireg[31]}},ireg[31],ireg[7],ireg[30:25],ireg[11:8],1'b0};
+                
+                case (ireg[6:0])
+                7'b0000011: state <= LOAD;
+                7'b0001111: state <= MISCMEM;
+                7'b0010011: state <= OPIMM;
+                7'b0010111: state <= AUIPC;
+                7'b0100011: state <= STORE;
+                7'b0101111: state <= AMO;
+                7'b0110011: state <= OP;
+                7'b0110111: state <= LUI;
+                7'b1100011: state <= BRANCH;
+                7'b1100111: state <= JALR;
+                7'b1101111: state <= JAL;
+                7'b1110011: state <= SYSTEM;
+                default:    state <= HALT;
+                endcase
+            end
+
+            LOAD: begin         // Load, I-type. Begin load from memory               
+                if (complete == 0) begin    // Ensure previous memory access has completed before continuing
+                    address <= areg + {{20{ireg[31]}}, ireg[31:20]};
+                    width   <= ireg[13:12];    // 0 = 8 bits, 1 = 16 bits, 2 = 32 bits
+                    read    <= 1;
+                    state   <= LOAD_W;
                 end
             end
-            
-            LOAD: begin    // Load, I-type
+
+            LOAD_W: begin       // Wait for the data to be available
                 if (complete == 0) begin
-                    address  <= xreg[rs1] + {{20{ireg[31]}}, ireg[31:20]};
-                    width    <= ireg[13:12];    // 0 = 8 bits, 1 = 16 bits, 2 = 32 bits
-                    read     <= 1;
+                    //read <= 1;
                 end else begin
-                    //load <= data_io[31:0];
-                    //read  <= 0;
-                    //state <= LOADREG;
-                    
+                    dreg <= data_io;
                     read  <= 0;
-                    state <= NEXT;
-                    
-                    case (ireg[14:12])
-                    3'b000: xreg[rd] <= {{24{data_io[7]}},data_io[7:0]};    // LB, Load byte (signed)
-                    3'b001: xreg[rd] <= {{16{data_io[15]}},data_io[15:0]};  // LH, Load half (signed)
-                    3'b010: xreg[rd] <= data_io[31:0];                   // LW, Load word
-                    3'b100: xreg[rd] <= {24'h0,data_io[7:0]};   // LBU, Load byte unsigned
-                    3'b101: xreg[rd] <= {16'h0,data_io[15:0]};  // LHU, Load half unsigned
-                    default: state <= HALT;
-                    endcase
+                    state <= LOAD_END;
                 end
             end
             
-            /*LOADREG: begin    // Load, I-type
+            LOAD_END: begin       // Wait for the data to be available
+                state <= NEXT;
+                
                 case (ireg[14:12])
-                3'b000: xreg[rd] <= {{24{load[7]}},load[7:0]};    // LB, Load byte (signed)
-                3'b001: xreg[rd] <= {{16{load[15]}},load[15:0]};  // LH, Load half (signed)
-                3'b010: xreg[rd] <= load[31:0];                   // LW, Load word
-                3'b100: xreg[rd] <= {24'h0,load[7:0]};   // LBU, Load byte unsigned
-                3'b101: xreg[rd] <= {16'h0,load[15:0]};  // LHU, Load half unsigned
+                3'b000: xreg[rd] <= {{24{dreg[7]}},dreg[7:0]};    // LB, Load byte (signed)
+                3'b001: xreg[rd] <= {{16{dreg[15]}},dreg[15:0]};  // LH, Load half (signed)
+                3'b010: xreg[rd] <= dreg[31:0];                   // LW, Load word
+                3'b100: xreg[rd] <= {24'h0,dreg[7:0]};   // LBU, Load byte unsigned
+                3'b101: xreg[rd] <= {16'h0,dreg[15:0]};  // LHU, Load half unsigned
                 default: state <= HALT;
                 endcase
+            end
 
-                state <= NEXT;
-            end*/
-            
             MISCMEM: begin  // MISC-MEM, I-type
                 case (ireg[14:12])
                 3'b000: state <= NEXT;  // Fence, nothing to do because no cache
@@ -304,70 +287,86 @@ module cpu(
                 default: state <= HALT;
                 endcase
             end
-
+            
             OPIMM: begin    // Immediate operation, I-type
                 case (ireg[14:12])
                 3'b000: begin   // Add
-                    xreg[rd] <= xreg[rs1] + {{20{ireg[31]}}, ireg[31:20]};
+                    xreg[rd] <= areg + {{20{ireg[31]}}, ireg[31:20]};
                     state    <= NEXT;
                 end
                 3'b001: begin   // SLL Logical Shift Left
-                    xreg[rd]    <= xreg[rs1];
+                    xreg[rd]    <= areg;
                     shift_count <= ireg[24:20];
                     state       <= SHIFT;
                 end
                 3'b010: begin   // SLTI, Set less than immediate (signed)
-                    xreg[rd] <= ($signed(xreg[rs1]) < $signed(ireg[31:20])) ? 1 : 0;
+                    xreg[rd] <= ($signed(areg) < $signed(ireg[31:20])) ? 1 : 0;
                     state    <= NEXT;
                 end
                 3'b011: begin   // SLTIU, Set less than immediate unsigned
-                    xreg[rd] <= (xreg[rs1] < ireg[31:20]) ? 1 : 0;
+                    xreg[rd] <= (areg < ireg[31:20]) ? 1 : 0;
                     state    <= NEXT;
                 end
                 3'b100: begin   // Xor
-                    xreg[rd] <= xreg[rs1] ^ {{20{ireg[31]}}, ireg[31:20]};
+                    xreg[rd] <= areg ^ {{20{ireg[31]}}, ireg[31:20]};
                     state    <= NEXT;
                 end
                 3'b101: begin   // SRL/SRA Logical/Arithmetic Shift Right
-                    xreg[rd]    <= xreg[rs1];
+                    xreg[rd]    <= areg;
                     shift_count <= ireg[24:20];
                     state       <= SHIFT;
                 end
                 3'b110: begin   // Or
-                    xreg[rd] <= xreg[rs1] | {{20{ireg[31]}}, ireg[31:20]};
+                    xreg[rd] <= areg | {{20{ireg[31]}}, ireg[31:20]};
                     state    <= NEXT;
                 end
                 3'b111: begin   // And
-                    xreg[rd] <= xreg[rs1] & {{20{ireg[31]}}, ireg[31:20]};
+                    xreg[rd] <= areg & {{20{ireg[31]}}, ireg[31:20]};
                     state    <= NEXT;
                 end
                 endcase
             end
-                
+
             AUIPC: begin
                 xreg[rd] <= pc + {ireg[31:12],12'h000};
                 state    <= NEXT;
             end
             
-            STORE: begin    // Store, S-type
+            STORE: begin    // Store, S-type. Begin write to memory
                 if (complete == 0) begin
-                    data_out <= xreg[rs2];
-                    address  <= xreg[rs1] + {{20{ireg[31]}},ireg[31:25],ireg[11:7]};
+                    data_out <= breg;
+                    address  <= areg + {{20{ireg[31]}},ireg[31:25],ireg[11:7]};
                     width    <= ireg[13:12];    // 0 = 8 bits, 1 = 16 bits, 2 = 32 bits, 3 = undefined
-                    write    <= 1;
-                end else begin
-                    write <= 0;
-                    state <= NEXT;
+                    write <= 1;
+                    drive    <= 1;
+                    state    <= STORE_W;
                 end
             end
             
+            STORE_W: begin    // Store, S-type
+                if (complete == 0) begin
+                    //write <= 1;
+                end else begin
+                    write <= 0;
+                    drive <= 0;
+                    state <= NEXT;
+                end
+            end
+
             AMO: begin  // Atomic memory operation, R-type
                 // First do the read
-                if (complete == 0) begin
-                    address <= xreg[rs1];
-                    temp    <= xreg[rs2];
+                if (complete == 0) begin    // Wait for previous memory access to complete
+                    address <= areg;
+                    temp    <= breg;        // Do we need temp ??
                     width   <= 2'h2;
-                    read    <= 1;
+                    state   <= AMO_W;
+                end
+            end
+            
+            AMO_W: begin  // Atomic memory operation, R-type
+                // First do the read
+                if (complete == 0) begin
+                    read <= 1;
                 end else begin
                     xreg[rd] <= data_io;
                     read     <= 0;
@@ -375,11 +374,11 @@ module cpu(
                     if (ireg[31:27] == 5'b00010)
                         state <= NEXT;  // No need to write anything
                     else
-                        state <= AMOW;
+                        state <= AMO_WR;
                 end
             end
             
-            AMOW: begin  // Next do the op and the store
+            AMO_WR: begin  // Next do the op and the store
                 if (complete == 0) begin
                     case (ireg[31:27])        
                     5'b00000: data_out <= xreg[rd] + temp;  // Add
@@ -409,61 +408,67 @@ module cpu(
                         data_out <= xreg[rd];
                     default: state <= HALT;
                     endcase
-                    write    <= 1;
+                    drive <= 1;
+                    state <= AMO_WR_W;
+                end
+            end
+             
+            AMO_WR_W: begin
+                if (complete == 0) begin
+                    write <= 1;
                 end else begin
                     write <= 0;
+                    drive <= 0;
                     state <= NEXT;
                 end
             end
-            
+           
             OP: begin   // Operation, R-type
                 if (ireg[25] == 0) begin
                     case (ireg[14:12])
                     3'b000: begin   // Add/Sub
                         if (ireg[30] == 0)
-                            xreg[rd] <= xreg[rs1] + xreg[rs2];
+                            xreg[rd] <= areg + breg;
                         else
-                            xreg[rd] <= xreg[rs1] - xreg[rs2];
+                            xreg[rd] <= areg - breg;
                         state <= NEXT;
                     end
                     3'b001: begin   // SLL, Shift Left Logical
-                        xreg[rd]    <= xreg[rs1];
-                        shift_count <= xreg[rs2][4:0];
+                        xreg[rd]    <= areg;
+                        shift_count <= breg[4:0];
                         state       <= SHIFT;
                     end
                     3'b010: begin   // SLT, Set less than (signed)
-                        xreg[rd] <= ($signed(xreg[rs1]) < $signed(xreg[rs2])) ? 1 : 0;
+                        xreg[rd] <= ($signed(areg) < $signed(breg)) ? 1 : 0;
                         state    <= NEXT;
                     end
                     3'b011: begin   // SLTU, Set less than unsigned
-                        xreg[rd] <= (xreg[rs1] < xreg[rs2]) ? 1 : 0;
+                        xreg[rd] <= (areg < breg) ? 1 : 0;
                         state    <= NEXT;
                     end
                     3'b100: begin   // Xor
-                        xreg[rd] <= xreg[rs1] ^ xreg[rs2];
+                        xreg[rd] <= areg ^ breg;
                         state    <= NEXT;
                     end
                     3'b101: begin   // SRL/SRA Logical/Arithmetic Shift Right
-                        xreg[rd]    <= xreg[rs1];
-                        shift_count <= xreg[rs2][4:0];
+                        xreg[rd]    <= areg;
+                        shift_count <= breg[4:0];
                         state       <= SHIFT;
                     end                            
                     3'b110: begin   // Or
-                        xreg[rd] <= xreg[rs1] | xreg[rs2];
+                        xreg[rd] <= areg | breg;
                         state    <= NEXT;
                     end
                     3'b111: begin   // And
-                        xreg[rd] <= xreg[rs1] & xreg[rs2];
+                        xreg[rd] <= areg & breg;
                         state    <= NEXT;
                     end
                     endcase
                 end else begin
                     case (ireg[14:12])
-                    3'b000: begin   //  MUL multiply
-                        //xreg[rd] <= xreg[rs1] * xreg[rs2];
-                        //state <= NEXT;
-                        dividend  <= xreg[rs1]; // Not very good register names!
-                        divisor   <= xreg[rs2];
+                    3'b000: begin           //  MUL multiply
+                        dividend  <= areg;  // Not very good register names!
+                        divisor   <= breg;
                         ndividend <= 0;
                         ndivisor  <= 0;
                         quotient  <= 0;     // High word
@@ -472,23 +477,19 @@ module cpu(
                         state       <= MULT;
                     end
                     3'b001: begin   // MULH, multiply high word (signed x signed)
-                        //xreg[rd] <= ($signed({{32{xreg[rs1][31]}},xreg[rs1]}) * $signed({{32{xreg[rs2][31]}},xreg[rs2]})) >> 32;
-                        //state <= NEXT;
-                        dividend  <= xreg[rs1][31] ? 0-$signed(xreg[rs1]) : xreg[rs1];
-                        divisor   <= xreg[rs2][31] ? 0-$signed(xreg[rs2]) : xreg[rs2];
-                        ndividend <= xreg[rs1][31];
-                        ndivisor  <= xreg[rs2][31];
+                        dividend  <= areg[31] ? 0-$signed(areg) : areg;
+                        divisor   <= breg[31] ? 0-$signed(breg) : breg;
+                        ndividend <= areg[31];
+                        ndivisor  <= breg[31];
                         quotient  <= 0;
                         remainder <= 0;
                         shift_count <= 32;
                         state       <= MULT;
                     end
                     3'b010: begin   // MULHSU, multiply high word (signed x unsigned)
-                        //xreg[rd] <= ($signed({{32{xreg[rs1][31]}},xreg[rs1]}) * xreg[rs2]) >> 32;
-                        //state <= NEXT;
-                        dividend  <= xreg[rs1][31] ? 0-$signed(xreg[rs1]) : xreg[rs1];
-                        divisor   <= xreg[rs2];
-                        ndividend <= xreg[rs1][31];
+                        dividend  <= areg[31] ? 0-$signed(areg) : areg;
+                        divisor   <= breg;
+                        ndividend <= areg[31];
                         ndivisor  <= 0;
                         quotient  <= 0;
                         remainder <= 0;
@@ -496,10 +497,8 @@ module cpu(
                         state       <= MULT;
                     end
                     3'b011: begin   // MULHU, multiply high word (unsigned x unsigned)
-                        //xreg[rd] <= ({32'h0,xreg[rs1]} * xreg[rs2]) >> 32;
-                        //state <= NEXT;
-                        dividend  <= xreg[rs1];
-                        divisor   <= xreg[rs2];
+                        dividend  <= areg;
+                        divisor   <= breg;
                         ndividend <= 0;
                         ndivisor  <= 0;
                         quotient  <= 0;     // High word
@@ -508,18 +507,17 @@ module cpu(
                         state       <= MULT;
                     end
                     3'b100: begin   // DIV, signed division
-                        //xreg[rd] <= (xreg[rs2] == 0) ? -1 : ($signed(xreg[rs1]) / $signed(xreg[rs2]));
-                        if (xreg[rs2] == 0) begin
+                        if (breg == 0) begin
                             xreg[rd] <= ~0;
                             state    <= NEXT;
-                        end else if ((xreg[rs1] == 32'h80_00_00_00) && (xreg[rs2] == ~0)) begin
-                            xreg[rd] <= xreg[rs1];
+                        end else if ((areg == 32'h80_00_00_00) && (breg == ~0)) begin
+                            xreg[rd] <= areg;
                             state    <= NEXT;
                         end else begin
-                            dividend  <= xreg[rs1][31] ? 0-$signed(xreg[rs1]) : xreg[rs1];
-                            divisor   <= xreg[rs2][31] ? 0-$signed(xreg[rs2]) : xreg[rs2];
-                            ndividend <= xreg[rs1][31];
-                            ndivisor  <= xreg[rs2][31];
+                            dividend  <= areg[31] ? 0-$signed(areg) : areg;
+                            divisor   <= breg[31] ? 0-$signed(areg) : breg;
+                            ndividend <= areg[31];
+                            ndivisor  <= breg[31];
                             quotient  <= 0;
                             remainder <= 0;
                             shift_count <= 32;
@@ -527,13 +525,12 @@ module cpu(
                         end
                     end
                     3'b101: begin       // DIVU, unsigned division
-                        //xreg[rd] <= (xreg[rs2] == 0) ? -1 : (xreg[rs1] / xreg[rs2]);
-                        if (xreg[rs2] == 0) begin
+                        if (breg == 0) begin
                             xreg[rd] <= ~0;
                             state    <= NEXT;
                         end else begin
-                            dividend  <= xreg[rs1];
-                            divisor   <= xreg[rs2];
+                            dividend  <= areg;  // Do we need these divident and divisor registers ??
+                            divisor   <= breg;
                             ndividend <= 0;
                             ndivisor  <= 0;
                             quotient  <= 0;
@@ -543,18 +540,17 @@ module cpu(
                         end
                     end
                     3'b110: begin   // REM, signed remainder (modulus)
-                        //xreg[rd] = $signed(xreg[rs1]) % $signed(xreg[rs2]);
-                        if (xreg[rs2] == 0) begin
-                            xreg[rd] <= xreg[rs1];
+                        if (breg == 0) begin
+                            xreg[rd] <= areg;
                             state    <= NEXT;
-                        end else if ((xreg[rs1] == 32'h80_00_00_00) && (xreg[rs2] == ~0)) begin
+                        end else if ((areg == 32'h80_00_00_00) && (breg == ~0)) begin
                             xreg[rd] <= 0;
                             state    <= NEXT;
                         end else begin
-                            dividend  <= xreg[rs1][31] ? 0-$signed(xreg[rs1]) : xreg[rs1];
-                            divisor   <= xreg[rs2][31] ? 0-$signed(xreg[rs2]) : xreg[rs2];
-                            ndividend <= xreg[rs1][31];
-                            ndivisor  <= xreg[rs2][31];
+                            dividend  <= areg[31] ? 0-$signed(areg) : areg;
+                            divisor   <= breg[31] ? 0-$signed(breg) : breg;
+                            ndividend <= areg[31];
+                            ndivisor  <= breg[31];
                             quotient  <= 0;
                             remainder <= 0;
                             shift_count <= 32;
@@ -562,13 +558,12 @@ module cpu(
                         end
                     end
                     3'b111: begin   // REMU, unsigned remainder (modulus)
-                        //xreg[rd] <= (xreg[rs2] == 0) ? -1 : (xreg[rs1] / xreg[rs2]);
-                        if (xreg[rs2] == 0) begin
-                            xreg[rd] <= xreg[rs1];
+                        if (breg == 0) begin
+                            xreg[rd] <= areg;
                             state    <= NEXT;
                         end else begin
-                            dividend  <= xreg[rs1];
-                            divisor   <= xreg[rs2];
+                            dividend  <= areg;
+                            divisor   <= breg;
                             ndividend <= 0;
                             ndivisor  <= 0;
                             quotient  <= 0;
@@ -664,54 +659,53 @@ module cpu(
             BRANCH: begin       // Branch, B-type
                 case (ireg[14:12])
                 3'b000: begin       // BEQ, Branch if equal
-                    if (xreg[rs1] == xreg[rs2]) begin
-                        pc <= pc + {{19{ireg[31]}},ireg[31],ireg[7],ireg[30:25],ireg[11:8],1'b0};
-                        state <= INTR;
-                    end else
+                    if (areg == breg)
+                        state <= BRANCH2;
+                    else
                         state <= NEXT;
                 end
                 3'b001: begin       // BNE, Branch if not equal
-                    if (xreg[rs1] != xreg[rs2]) begin
-                        pc <= pc + {{19{ireg[31]}},ireg[31],ireg[7],ireg[30:25],ireg[11:8],1'b0};
-                        state <= INTR;
-                    end else
+                    if (areg != breg)
+                        state <= BRANCH2;
+                    else
                         state <= NEXT;
                 end
                 3'b100: begin       // BLT, Branch if Less Than (signed)
-                    if ($signed(xreg[rs1]) < $signed(xreg[rs2])) begin
-                        pc <= pc + {{19{ireg[31]}},ireg[31],ireg[7],ireg[30:25],ireg[11:8],1'b0};
-                        state <= INTR;
-                    end else
+                    if ($signed(areg) < $signed(breg))
+                        state <= BRANCH2;
+                    else
                         state <= NEXT;
                 end
                 3'b101: begin       // BGE, Branch if Greater or Equal (signed)
-                    if ($signed(xreg[rs1]) >= $signed(xreg[rs2])) begin
-                        pc <= pc + {{19{ireg[31]}},ireg[31],ireg[7],ireg[30:25],ireg[11:8],1'b0};
-                        state <= INTR;
-                    end else
+                    if ($signed(areg) >= $signed(breg))
+                        state <= BRANCH2;
+                    else
                         state <= NEXT;
                 end
                 3'b110: begin       // BLTU, Branch if Less Than (unsigned)
-                    if (xreg[rs1] < xreg[rs2]) begin
-                        pc <= pc + {{19{ireg[31]}},ireg[31],ireg[7],ireg[30:25],ireg[11:8],1'b0};
-                        state <= INTR;
-                    end else
+                    if (areg < breg)
+                        state <= BRANCH2;
+                    else
                         state <= NEXT;
                 end
                 3'b111: begin       // BGEU, Branch if Greater or Equal (unsigned)
-                    if (xreg[rs1] >= xreg[rs2]) begin
-                        pc <= pc + {{19{ireg[31]}},ireg[31],ireg[7],ireg[30:25],ireg[11:8],1'b0};
-                        state <= INTR;
-                    end else
+                    if (areg >= breg)
+                        state <= BRANCH2;
+                    else
                         state <= NEXT;
                 end
                 default: state <= HALT;
                 endcase
             end
             
+            BRANCH2: begin       // Branch, B-type
+                pc <= pc + jaddr;
+                state <= INTR;
+            end
+            
             JALR: begin  // Jump and link, I-type
                 xreg[rd] <= pc + 4;
-                pc       <= (xreg[rs1] + {{20{ireg[31]}},ireg[31:20]}) & 32'hfffffffe;    // Set LSB to zero
+                pc       <= (areg + {{20{ireg[31]}},ireg[31:20]}) & 32'hfffffffe;    // Set LSB to zero
                 state    <= INTR;
             end
             
@@ -771,15 +765,15 @@ module cpu(
 
                     case (ireg[14:12])
                     3'b001: begin   // CSRRW, Atomic read/write CSR
-                        csreg_wdata <= xreg[rs1];
+                        csreg_wdata <= areg;
                         state <= CSRDONE;
                     end
                     3'b010: begin   // CSRRS, Atomic read and set bits in CSR
-                        csreg_wdata <= temp | xreg[rs1];
+                        csreg_wdata <= temp | areg;
                         state <= CSRDONE;
                     end
                     3'b011: begin   // CSRRC, Atomic read and clear bits in CSR
-                        csreg_wdata <= temp & ~xreg[rs1];
+                        csreg_wdata <= temp & ~areg;
                         state <= CSRDONE;
                     end
                     3'b101: begin   // CSRRWI, Atomic read/write CSR immediate
@@ -806,20 +800,18 @@ module cpu(
             end
             
             NEXT: begin
-                if (complete == 0) begin    // Ensure previous read/write access has completed before we attempt to read a new instruction
-                    pc    <= pc + 4;
-                    state <= INTR;
-                end
+                pc    <= pc + 4;
+                state <= INTR;
             end
-               
-            INTR: begin                
+        
+            INTR: begin
                 if (interrupt) begin
                     trap  <= 32'h80000007;
                     state <= TRAP;      // PC is the instruction we will return to
-                end else  
+                end else
                     state <= FETCH;
             end
-            
+
             TRAP: begin
                 trap      <= 0;
                 privilege <= 3;
