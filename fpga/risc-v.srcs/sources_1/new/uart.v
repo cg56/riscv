@@ -1,17 +1,24 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
 // 
-// Copyright Colm Gavin, 2023. All rights reserved.
-// 
-// Emulates an 8250 UART. Only two registers are supported:
+// Emulates an 8250 UART. This takes some liberties. If a write is attempted
+// before the previous write has finished being transmitted, then the write
+// will stall and won't complete until the transmit buffer is empty.
+//
+// Only two registers are supported:
 // Address 00 = UART read/write buffer
 // Address 05 = UART status reg
+//      bit 0 - data is ready to read
+//      bit 5 -
+//      bit 6 -
+//
+// Copyright Colm Gavin, 2024. All rights reserved.
 //
 //////////////////////////////////////////////////////////////////////////////////
 
 module uart(
     input clk,              // 100Mhz clock
-    input reset,
+    input reset,            // Active high reset
     input[7:0] address,
     inout[31:0] data_io,    // Only supports 8-bit reads and writes
     input enable,           // Enable the uart for reading or writing
