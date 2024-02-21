@@ -36,7 +36,7 @@ module top(
 
     output[15:0] LED,
     output CA, CB, CC, CD, CE, CF, CG,
-    output [7:0] AN,
+    output[7:0] AN,
     input[15:0] SW,
     
     // DDR memory tnterface
@@ -78,6 +78,14 @@ module top(
     debounce db(clk_100mhz, ~CPU_RESETN, reset_switch);
     wire reset = ~pll_locked | reset_switch;    // Master reset
 
+    // Define the I/O bus from the CPU to memory and memory-mapped I/O
+    
+    wire[31:0] address;
+    wire[31:0] data_io;
+    wire[1:0]  width;   // 00 = 8-bit byte, 01 = 16-bit short, 10 = 32-bit word
+    wire       read;
+    wire       write;
+
     // Display for debug output
     
     wire[31:0] sseg_data;   // The value to be displayed
@@ -89,29 +97,29 @@ module top(
         .segments({CG,CF,CE,CD,CC,CB,CA}),
         .anodes(AN)
     );
-
-    // Define the I/O bus from the CPU to memory and memory-mapped I/O
-    
-    wire[31:0] address;
-    wire[31:0] data_io;
-    wire[1:0]  width;   // 00 = 8-bit byte, 01 = 16-bit short, 10 = 32-bit word
-    wire       read;
-    wire       write;
+ 
+    assign sseg_data = data_io;
+    assign LED[0]    = read;
+    assign LED[1]    = write;
+    assign LED[3:2]  = width;
     
     // The memory controller
+
+    wire[22:0] ram_address;     // 16M x 64-bit words 
+    wire[127:0] ram_data_in;    // Data in for write
+    wire[127:0] ram_data_out;   // Data out for read
+    wire ram_read;              // Request to read from the memory
+    wire ram_write;             // Request to write to the memory
+    wire ram_complete;
     
-    wire ram_enable;    // Data requested or data is ready to write
-    wire ram_complete;  // Data is ready or data has been written
-  
     ram memory(
         .clock(clk_200mhz),
         .reset(reset),
-        .address(address[26:0]), // 27-bit address lines for 128Kbyte of memory
-        .data_io(data_io),
-        .width(width),
-        .enable(ram_enable),
-        .read(read),
-        .write(write),
+        .address(ram_address),
+        .data_in(ram_data_in),
+        .data_out(ram_data_out),
+        .read(ram_read),
+        .write(ram_write),
         .complete(ram_complete),
         // DDR memory tnterface
         .ddr2_dq(ddr2_dq),
@@ -129,14 +137,36 @@ module top(
         .ddr2_dm(ddr2_dm),
         .ddr2_odt(ddr2_odt)
     );
+    
+    // Ram cache
+    wire cache_enable;    // Data requested or data is ready to write
+    wire cache_complete;  // Data is ready or data has been written
 
+    cache cash(
+        .clock(clk_100mhz),
+        .reset(reset),
+        .address(address[26:0]), // 27-bit address lines for 128Kbyte of memory
+        .data_io(data_io),
+        .width(width),
+        .enable(cache_enable),
+        .read(read),
+        .write(write),
+        .complete(cache_complete),
+        .ram_address(ram_address),   // 16M x 64-bit words 
+        .ram_data_in(ram_data_in),   // Data in for write
+        .ram_data_out(ram_data_out),       // Data out for read
+        .ram_read(ram_read),            // Request to read from the memory
+        .ram_write(ram_write),           // Request to write to the memory
+        .ram_complete(ram_complete)
+    );
+    
     // Rom with the hard-coded boot loader
     
     wire rom_enable;    // Data requested
     wire rom_complete;  // Data is ready
     
     rom bootroom(
-        .clock(clk_200mhz),
+        .clock(clk_100mhz),
         .reset(reset),
         .address(address[12:0]),
         .data_io(data_io),
@@ -222,7 +252,7 @@ module top(
     
     address_decoder adec(
         .address(address[31:24]),     // High byte of the address bus
-        .ram_enable(ram_enable),
+        .ram_enable(cache_enable),
         .rom_enable(rom_enable),
         .uart_enable(uart_enable),
         .clint_enable(clint_enable),
@@ -230,7 +260,7 @@ module top(
         .sw_enable(sw_enable)
     );
     
-    wire complete = ram_complete | rom_complete | uart_complete | clint_complete | spi_complete | sw_complete;
+    wire complete = cache_complete | rom_complete | uart_complete | clint_complete | spi_complete | sw_complete;
 
     // The CPU itself
     
@@ -244,8 +274,8 @@ module top(
         .read(read),
         .complete(complete),
         .interrupt_req(interrupt_req),
-        .led(LED[15:8]),
-        .sseg_data(sseg_data),
+        //.led(LED[15:8]),
+        //.sseg_data(sseg_data),
         .debug(SW[15:14])
     );
     
