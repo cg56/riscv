@@ -18,8 +18,8 @@ module cpu(
     output reg read,            // Read cycle
     input complete,             // Read/write cycle is complete
     input interrupt_req,        // Timer interrupt request
-    output[7:0] led,            // For debug
-    output reg[31:0] sseg_data, // For debug
+    //output[7:0] led,            // For debug
+    //output reg[31:0] sseg_data, // For debug
     input[1:0] debug            // For debug
     );
     
@@ -102,7 +102,7 @@ module cpu(
     reg[31:0] remainder;
     reg[31:0] memval;
     
-    assign led[7:0] = state;   //??
+    //assign led[7:0] = state;   //??
     
     localparam FETCH    = 0;
     localparam FETCH_W  = 1;
@@ -157,7 +157,7 @@ module cpu(
             halt      <= 0;
             trap      <= 0;
             mret      <= 0;
-            sseg_data <= 32'h00;
+            //sseg_data <= 32'h00;
         end else begin
             case (state)
 
@@ -225,7 +225,7 @@ module cpu(
             // 11      BRANCH JALR     reserved JAL      SYSTEM reserved custom-3/rv128 ? 80b
 
             DECODE: begin
-                sseg_data <= debug[0] ? pc : ireg;
+                //sseg_data <= debug[0] ? pc : ireg;
 
                 areg <= xreg[rs1];
                 breg <= xreg[rs2];

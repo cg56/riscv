@@ -16,7 +16,6 @@
 //
 //////////////////////////////////////////////////////////////////////////////////
 
-
 module address_decoder(
     input[7:0] address,     // High byte of the address bus
     output ram_enable,
@@ -34,5 +33,4 @@ module address_decoder(
     assign clint_enable = (address[7:0] == 8'b00010001);
     assign spi_enable   = (address[7:0] == 8'b00010010);
     assign sw_enable    = (address[7:0] == 8'b00010011);
-
 endmodule

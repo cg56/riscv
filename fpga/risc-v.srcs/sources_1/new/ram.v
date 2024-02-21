@@ -17,10 +17,9 @@
 module ram(
     input clock,            // 200MHz clock for the mig
     input reset,            // Active high reset
-    input[26:0] address,    // 128Kbyte address space
-    inout[31:0] data_io,    // Data in for write, data out for read
-    input[1:0] width,       // 0 = 8 bits, 1 = 16 bits, 2 = 32 bits 
-    input enable,           // Enable the memory for reading or writing
+    input[22:0] address,    // 128Kbyte address space. 128-bit (16-byte) rows
+    input[127:0] data_in,       // Data in for write
+    output reg[127:0] data_out, // Data out for read
     input read,             // Request to read from the memory
     input write,            // Request to write to the memory
     output reg complete,    // The read or write request is complete
@@ -50,7 +49,6 @@ module ram(
     reg         mem_enable;     // Strobe for the inputs to the mig
     reg         write_enable;
     reg[63:0]   write_data;
-    reg[7:0]    write_mask;     // 1 bit per byte
     reg         write_end;      // Signals last write clock cycle
     wire[63:0]  read_data;
     wire        read_end;
@@ -83,12 +81,12 @@ module ram(
         .ddr2_odt(ddr2_odt),
 
         .sys_clk_i(clock),
-        .app_addr(address[26:1]),   // The lest-significant address bit selects the byte within a short
+        .app_addr({address[22:0],4'b0}),   // The lest-significant address bit selects the byte within a short
         .app_cmd(command),
         .app_en(mem_enable),
         .app_wdf_data(write_data),
         .app_wdf_end(write_end),
-        .app_wdf_mask(write_mask),
+        .app_wdf_mask(8'h00),               // Always write all 128 bits
         .app_wdf_wren(write_enable),
         .app_rd_data(read_data),
         .app_rd_data_end(read_end),
@@ -106,11 +104,6 @@ module ram(
         .init_calib_complete(),     // Internal initialization and calibration is complete
         .sys_rst(~reset)    // System reset
         );
-
-    // Tri-state bus
-    
-    reg[31:0] data_out;
-    assign data_io = (read & enable) ? data_out : 32'bZ;
 
     // The state machine
     
@@ -131,7 +124,6 @@ module ram(
             complete <= 0;
             
             command      <= 3'h0;
-            write_mask   <= 8'h00;
             write_data   <= 64'h0;
             write_enable <= 0;
             write_end    <= 0;
@@ -140,11 +132,11 @@ module ram(
             case (state)
             
             IDLE: begin
-                if (read & enable) begin
+                if (read) begin
                     mem_enable <= 1;
                     command    <= 3'h1;
                     state      <= START_READ;
-                end else if (write & enable) begin
+                end else if (write) begin
                     mem_enable <= 1;
                     command    <= 3'h0;
                     write_end  <= 0;
@@ -164,20 +156,11 @@ module ram(
                 // Wait until data is ready
                 if (read_valid) begin
                     if (read_end) begin
-                        state    <= FINISHED;
+                        data_out[127:64] <= read_data;  // Read from the 2nd packet
                         complete <= 1;
-                    end else // Only use the data from the first packet
-                        case (width)
-                        3,
-                        2: data_out <= read_data[31:0];
-                        1: data_out <= {16'b0, read_data[15:0]};
-                        0: begin
-                            if (address[0])
-                                data_out <= {24'b0, read_data[15:8]};
-                            else
-                                data_out <= {24'b0, read_data[7:0]};
-                        end
-                        endcase
+                        state    <= FINISHED;
+                    end else
+                        data_out[63:0] <= read_data;    // Read from the 1st packet
                 end
             end
                        
@@ -185,48 +168,26 @@ module ram(
                 // Wait until the command has been accepted
                 if (memory_ready) begin
                     mem_enable <= 0;
-                    state      <= WRITE_HIGH;
+                    state      <= WRITE_LOW;
                 end
             end
 
-            WRITE_HIGH: begin   // Send the first packet
+            WRITE_LOW: begin   // Send the first packet
                 // Wait for write queue to have space
                 if (write_ready) begin
-                    case (width)
-                    3,
-                    2: begin
-                        write_mask       <= 8'hF0;  // Only write the lower 32 bits
-                        write_data[63:0] <= {32'b0, data_io[31:0]};
-                    end
-                    1: begin
-                        write_mask       <= 8'hFC;  // Only write the lower 16 bits
-                        write_data[63:0] <= {48'b0, data_io[15:0]};
-                    end
-                    0: begin
-                        if (address[0]) begin
-                            write_mask       <= 8'hFD;  // Only write the mid 8 bits
-                            write_data[63:0] <= {48'b0, data_io[7:0], 8'b0};
-                        end else begin
-                            write_mask       <= 8'hFE;  // Only write the lower 8 bits
-                            write_data[63:0] <= {56'b0, data_io[7:0]};
-                        end
-                    end
-                    endcase
-
+                    write_data   <= data_in[63:0];
                     write_enable <= 1;
-                    state        <= WRITE_LOW;
+                    state        <= WRITE_HIGH;
                 end
             end
 
-            WRITE_LOW: begin    // Send the expected 2nd packet
+            WRITE_HIGH: begin    // Send the 2nd packet
                 // Wait for Write Data queue to have space
                 if (write_ready) begin 
-                    write_mask <= 8'hFF;  // Don't actually write anything
-                    write_data <= 64'h0;
-
-                    write_end <= 1;
-                    complete  <= 1;
-                    state     <= FINISHED;
+                    write_data <= data_in[127:64];
+                    write_end  <= 1;
+                    complete   <= 1;
+                    state      <= FINISHED;
                 end
             end
             
